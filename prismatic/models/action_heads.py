@@ -90,11 +90,16 @@ class L1RegressionActionHead(nn.Module):
         input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
+        num_action_branches=1,
     ):
         super().__init__()
         self.action_dim = action_dim
+        self.num_action_branches = num_action_branches
         self.model = MLPResNet(
-            num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
+            num_blocks=2,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=action_dim * num_action_branches,
         )
 
     def predict_action(self, actions_hidden_states):
@@ -106,6 +111,9 @@ class L1RegressionActionHead(nn.Module):
         device = actions_hidden_states.device
         rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         action = self.model(rearranged_actions_hidden_states)
+        if self.num_action_branches > 1:
+            action = action.reshape(batch_size, NUM_ACTIONS_CHUNK, self.num_action_branches, self.action_dim)
+            action = action.permute(0, 2, 1, 3).contiguous()
         return action
 
 # 这是diffusion的噪声预测器

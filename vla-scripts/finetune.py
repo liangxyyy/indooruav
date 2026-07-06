@@ -150,6 +150,7 @@ class FinetuneConfig:
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
+    num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_image_history: bool = False                  # If True, uses num_images_in_input primary-camera history frames
@@ -358,6 +359,7 @@ def run_forward_pass(
     device_id,
     use_l1_regression,
     use_diffusion,
+    num_action_branches,
     use_proprio,
     use_film,
     num_patches,
@@ -515,7 +517,11 @@ def run_forward_pass(
                 debug_info["predicted_actions"] = _shape(predicted_actions)
                 debug_info["predicted_actions_device"] = _device(predicted_actions)
             # Get full L1 loss,和专家动作的L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            if num_action_branches > 1:
+                ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
+            else:
+                ground_truth_actions_for_loss = ground_truth_actions
+            loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
 
         if use_diffusion:
             # Predict noise
@@ -555,19 +561,24 @@ def run_forward_pass(
         # Get detailed L1 losses for logging
         should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
+            predicted_actions_for_metrics = predicted_actions[:, 0] if predicted_actions.ndim == 4 else predicted_actions
             #分开的原因是：第一步动作最直接影响当前控制，未来动作更多是为了规划，当前动作更重要，所以单独算
             ground_truth_curr_action = ground_truth_actions[:, 0]
-            predicted_curr_action = predicted_actions[:, 0]
+            predicted_curr_action = predicted_actions_for_metrics[:, 0]
             ground_truth_next_actions = ground_truth_actions[:, 1:]
-            predicted_next_actions = predicted_actions[:, 1:]
+            predicted_next_actions = predicted_actions_for_metrics[:, 1:]
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
             next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-            metrics.update(
-                {
-                    "curr_action_l1_loss": curr_action_l1_loss.item(),
-                    "next_actions_l1_loss": next_actions_l1_loss.item(),
-                }
-            )
+            l1_metrics = {
+                "curr_action_l1_loss": curr_action_l1_loss.item(),
+                "next_actions_l1_loss": next_actions_l1_loss.item(),
+            }
+            if predicted_actions.ndim == 4:
+                branch_targets = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
+                per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(2, 3))
+                l1_metrics["all_branches_l1_loss"] = per_branch_l1.mean().item()
+                l1_metrics["best_branch_l1_loss"] = per_branch_l1.min(dim=1).values.mean().item()
+            metrics.update(l1_metrics)
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)，其中loss是用来反向传播的，metrics是用来记录日志的
     return loss, metrics
@@ -863,6 +874,7 @@ def run_validation(
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                num_action_branches=cfg.num_action_branches,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
@@ -914,6 +926,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    if cfg.num_action_branches < 1:
+        raise ValueError("num_action_branches must be >= 1")
+    if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
+        raise ValueError("num_action_branches > 1 is currently supported only with use_l1_regression=True")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -1035,7 +1051,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "num_action_branches": cfg.num_action_branches,
+            },
             to_bf16=True,
         )
 
@@ -1180,6 +1201,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "all_branches_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training 真正开始训练（核心）
@@ -1199,6 +1222,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                num_action_branches=cfg.num_action_branches,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,

@@ -151,6 +151,8 @@ class FinetuneConfig:
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
+    branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
+    branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_image_history: bool = False                  # If True, uses num_images_in_input primary-camera history frames
@@ -360,6 +362,8 @@ def run_forward_pass(
     use_l1_regression,
     use_diffusion,
     num_action_branches,
+    branch_diversity_weight,
+    branch_diversity_margin,
     use_proprio,
     use_film,
     num_patches,
@@ -522,6 +526,25 @@ def run_forward_pass(
             else:
                 ground_truth_actions_for_loss = ground_truth_actions
             loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
+            if predicted_actions.ndim == 4 and branch_diversity_weight > 0:
+                branch_pair_distances = []
+                for left_branch in range(predicted_actions.shape[1]):
+                    for right_branch in range(left_branch + 1, predicted_actions.shape[1]):
+                        branch_pair_distances.append(
+                            torch.abs(
+                                predicted_actions[:, left_branch] - predicted_actions[:, right_branch]
+                            ).mean(dim=(1, 2))
+                        )
+                branch_pair_distances = torch.stack(branch_pair_distances, dim=1)
+                branch_mean_distance = branch_pair_distances.mean()
+                branch_diversity_loss = torch.relu(branch_diversity_margin - branch_pair_distances).mean()
+                loss = loss + branch_diversity_weight * branch_diversity_loss
+                metrics.update(
+                    {
+                        "branch_diversity_loss": branch_diversity_loss.item(),
+                        "branch_mean_distance": branch_mean_distance.item(),
+                    }
+                )
 
         if use_diffusion:
             # Predict noise
@@ -875,6 +898,8 @@ def run_validation(
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 num_action_branches=cfg.num_action_branches,
+                branch_diversity_weight=cfg.branch_diversity_weight,
+                branch_diversity_margin=cfg.branch_diversity_margin,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
@@ -930,6 +955,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
         raise ValueError("num_action_branches > 1 is currently supported only with use_l1_regression=True")
+    if cfg.branch_diversity_weight < 0:
+        raise ValueError("branch_diversity_weight must be >= 0")
+    if cfg.branch_diversity_margin < 0:
+        raise ValueError("branch_diversity_margin must be >= 0")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -1203,6 +1232,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "all_branches_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training 真正开始训练（核心）
@@ -1223,6 +1254,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 num_action_branches=cfg.num_action_branches,
+                branch_diversity_weight=cfg.branch_diversity_weight,
+                branch_diversity_margin=cfg.branch_diversity_margin,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
@@ -1246,6 +1279,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 for key, value in metrics.items():
                     if key.startswith("debug_"):
                         print(f"  {key.removeprefix('debug_')}: {value}")
+                print(f"\n[Debug] Batch {batch_idx} scalar metrics:")
+                for key, value in metrics.items():
+                    if not key.startswith("debug_"):
+                        print(f"  {key}: {value}")
 
             if cfg.debug_grad_norm and distributed_state.is_main_process and batch_idx < cfg.debug_num_batches:
                 grad_norms = {

@@ -152,6 +152,8 @@ class FinetuneConfig:
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
+    use_image_history: bool = False                  # If True, uses num_images_in_input primary-camera history frames
+    require_full_image_history: bool = True          # If True, skips chunks with padded history frames
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
     # Training configuration
@@ -445,6 +447,9 @@ def run_forward_pass(
                 "labels_device": _device(labels),
                 "ground_truth_actions": _shape(ground_truth_actions),
                 "ground_truth_actions_device": _device(ground_truth_actions),
+                "image_history_pad_mask": (
+                    batch["image_history_pad_mask"].tolist() if "image_history_pad_mask" in batch else "None"
+                ),
                 "current_action_mask_sum": int(current_action_mask.sum().item()),
                 "current_action_mask_device": _device(current_action_mask),
                 "next_actions_mask_sum": int(next_actions_mask.sum().item()),
@@ -1102,8 +1107,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     # )
     # ---
 
-    # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
-    use_wrist_image = cfg.num_images_in_input > 1
+    if cfg.use_image_history and cfg.num_images_in_input < 1:
+        raise ValueError("num_images_in_input must be >= 1 when use_image_history=True")
+
+    # Multi-image IndoorUAV uses primary-camera history, not wrist cameras.
+    use_wrist_image = cfg.num_images_in_input > 1 and not cfg.use_image_history
+    window_size = cfg.num_images_in_input if cfg.use_image_history else 1
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
@@ -1113,6 +1122,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
+        use_image_history=cfg.use_image_history,
+        num_images_in_input=cfg.num_images_in_input,
+        require_full_image_history=cfg.require_full_image_history,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1121,6 +1133,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        window_size=window_size,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1131,6 +1144,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            window_size=window_size,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

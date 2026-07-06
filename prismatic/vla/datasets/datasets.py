@@ -37,19 +37,37 @@ class RLDSBatchTransform:
     predict_stop_token: bool = True
     use_wrist_image: bool = False
     use_proprio: bool = False
+    use_image_history: bool = False
+    num_images_in_input: int = 1
+    require_full_image_history: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        dataset_name = rlds_batch["dataset_name"]
+        current_obs_index = self.num_images_in_input - 1 if self.use_image_history else 0
+        if self.use_image_history:
+            pad_mask = rlds_batch["observation"].get("pad_mask")
+            if self.require_full_image_history and (pad_mask is None or not np.all(pad_mask)):
+                return None
+            image_history = rlds_batch["observation"]["image_primary"][: self.num_images_in_input]
+            pixel_values = torch.cat(
+                [self.image_transform(Image.fromarray(image)) for image in image_history],
+                dim=0,
+            )
+        else:
+            img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+            pixel_values = self.image_transform(img)
+
+        action_chunk = rlds_batch["action"][current_obs_index:]
+        current_action = action_chunk[0]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-        actions = rlds_batch["action"]
+        actions = action_chunk
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
         # Get future action chunk
-        future_actions = rlds_batch["action"][1:]
+        future_actions = action_chunk[1:]
         future_actions_string = ''.join(self.action_tokenizer(future_actions))
 
         # Get action chunk string
@@ -71,7 +89,6 @@ class RLDSBatchTransform:
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-        pixel_values = self.image_transform(img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
@@ -90,8 +107,10 @@ class RLDSBatchTransform:
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
-            proprio = rlds_batch["observation"]["proprio"]
+            proprio = rlds_batch["observation"]["proprio"][current_obs_index]
             return_dict["proprio"] = proprio
+        if self.use_image_history:
+            return_dict["image_history_pad_mask"] = rlds_batch["observation"].get("pad_mask")
 
         return return_dict
 
@@ -106,9 +125,11 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        window_size: int = 1,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+        self.window_size = window_size
 
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
@@ -134,7 +155,7 @@ class RLDSDataset(IterableDataset):
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
+                window_size=self.window_size,                       # Observation history length
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
@@ -178,7 +199,9 @@ class RLDSDataset(IterableDataset):
 
     def __iter__(self) -> Dict[str, Any]:
         for rlds_batch in self.dataset.as_numpy_iterator():
-            yield self.batch_transform(rlds_batch)
+            transformed = self.batch_transform(rlds_batch)
+            if transformed is not None:
+                yield transformed
 
     def __len__(self) -> int:
         return self.dataset_length

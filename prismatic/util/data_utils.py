@@ -106,6 +106,13 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        if "image_history_pad_mask" in instances[0]:
+            image_history_pad_mask = torch.tensor(
+                np.stack([instance["image_history_pad_mask"] for instance in instances]),
+                dtype=torch.bool,
+            )
+        else:
+            image_history_pad_mask = None
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -153,4 +160,6 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if image_history_pad_mask is not None:
+            output["image_history_pad_mask"] = image_history_pad_mask
         return output

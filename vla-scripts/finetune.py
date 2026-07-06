@@ -65,6 +65,75 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def _shape(value) -> str:
+    if value is None:
+        return "None"
+    if hasattr(value, "shape"):
+        return str(tuple(value.shape))
+    return type(value).__name__
+
+
+def _device(value) -> str:
+    if value is None:
+        return "None"
+    if hasattr(value, "device"):
+        return str(value.device)
+    return "n/a"
+
+
+def _module_grad_norm(module: Optional[nn.Module]) -> Optional[float]:
+    if module is None:
+        return None
+
+    total_sq_norm = 0.0
+    has_grad = False
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        total_sq_norm += grad.norm(2).item() ** 2
+        has_grad = True
+
+    if not has_grad:
+        return None
+    return total_sq_norm ** 0.5
+
+
+def _print_dataset_statistics(dataset_statistics: dict) -> None:
+    print("Dataset statistics summary:")
+    for dataset_name, stats in dataset_statistics.items():
+        action_stats = stats.get("action", {})
+        proprio_stats = stats.get("proprio", {})
+        print(f"  dataset: {dataset_name}")
+        if "mean" in action_stats:
+            print(f"    action_dim: {len(action_stats['mean'])}")
+        if "mean" in proprio_stats:
+            print(f"    proprio_dim: {len(proprio_stats['mean'])}")
+        for key in ("num_trajectories", "num_transitions"):
+            if key in stats:
+                print(f"    {key}: {stats[key]}")
+
+
+def _distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _distributed_barrier() -> None:
+    if _distributed_is_initialized():
+        dist.barrier()
+
+
+class SingleProcessModuleWrapper(nn.Module):
+    """Matches DDP's .module interface when running without torch.distributed."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
 @dataclass
 class FinetuneConfig:
     # fmt: off
@@ -118,6 +187,9 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    debug_batch_shapes: bool = False                 # If True, print batch/action/mask shapes for initial batches
+    debug_grad_norm: bool = False                    # If True, print gradient norms for trainable components
+    debug_num_batches: int = 2                       # Number of initial batches to print when debug flags are enabled
 
     # fmt: on
 
@@ -215,6 +287,8 @@ def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DD
     Returns:
         DistributedDataParallel: PyTorch module wrapped with DDP.
     """
+    if not _distributed_is_initialized():
+        return SingleProcessModuleWrapper(module)
     return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
 
 
@@ -287,6 +361,7 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    debug_batch_shapes=False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -316,7 +391,13 @@ def run_forward_pass(
     metrics = {}
 
     # Get ground-truth action labels
+    input_ids = batch["input_ids"].to(device_id)
+    attention_mask = batch["attention_mask"].to(device_id)
+    pixel_values = batch["pixel_values"].to(torch.bfloat16).to(device_id)
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+    proprio = batch["proprio"].to(device_id).to(torch.bfloat16) if use_proprio else None
+    labels = batch["labels"].to(device_id)
+    debug_info = {}
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network. 如果使用diffusion，先给动作加噪声
     if use_diffusion:
@@ -332,12 +413,12 @@ def run_forward_pass(
     # VLA forward pass 前向传播，就是把图像，语言指令，机器人状态，动作等输入到VLA模型中，得到输出
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
-            input_ids=batch["input_ids"].to(device_id),     #文本token，包括 prompt 和动作占位 token
-            attention_mask=batch["attention_mask"].to(device_id),       # 哪些 token 有效
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),        # 图像特征
-            labels=batch["labels"],         # 语言模型训练时的动作 token label，里面包含动作token位置
+            input_ids=input_ids,     #文本token，包括 prompt 和动作占位 token
+            attention_mask=attention_mask,       # 哪些 token 有效
+            pixel_values=pixel_values,        # 图像特征
+            labels=labels,         # 语言模型训练时的动作 token label，里面包含动作token位置
             output_hidden_states=True,      #因为后面不是只要output.logits，而是要拿LLM最后一层hidden states去预测动作，所以要设置为True
-            proprio=batch["proprio"] if use_proprio else None,      # 机器人本体状态
+            proprio=proprio,      # 机器人本体状态
             proprio_projector=proprio_projector if use_proprio else None,
             noisy_actions=noisy_actions if use_diffusion else None,
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
@@ -346,9 +427,31 @@ def run_forward_pass(
         )
 
     # Get action masks needed for logging，找到哪些token对应当前动作，哪些token位置对应未来动作，生成action masks
-    ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)       
+    ground_truth_token_ids = labels[:, 1:]
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+    if debug_batch_shapes:
+        debug_info.update(
+            {
+                "input_ids": _shape(input_ids),
+                "input_ids_device": _device(input_ids),
+                "attention_mask": _shape(attention_mask),
+                "attention_mask_device": _device(attention_mask),
+                "pixel_values": _shape(pixel_values),
+                "pixel_values_device": _device(pixel_values),
+                "proprio": _shape(proprio),
+                "proprio_device": _device(proprio),
+                "labels": _shape(labels),
+                "labels_device": _device(labels),
+                "ground_truth_actions": _shape(ground_truth_actions),
+                "ground_truth_actions_device": _device(ground_truth_actions),
+                "current_action_mask_sum": int(current_action_mask.sum().item()),
+                "current_action_mask_device": _device(current_action_mask),
+                "next_actions_mask_sum": int(next_actions_mask.sum().item()),
+                "next_actions_mask_device": _device(next_actions_mask),
+                "num_patches": int(num_patches),
+            }
+        )
 
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
@@ -382,16 +485,30 @@ def run_forward_pass(
         # Get hidden states for text portion of prompt+response (after the vision patches)
         text_hidden_states = last_hidden_states[:, num_patches:-1]
         # Get hidden states for action portion of response
-        batch_size = batch["input_ids"].shape[0]
+        batch_size = input_ids.shape[0]
         actions_hidden_states = (
             text_hidden_states[current_action_mask | next_actions_mask]
             .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)=(B,56,D)        act_chunk_len=NUM_ACTIONS_CHUNK * ACTION_DIM=8*7=56
+        if debug_batch_shapes:
+            debug_info.update(
+                {
+                    "last_hidden_states": _shape(last_hidden_states),
+                    "last_hidden_states_device": _device(last_hidden_states),
+                    "text_hidden_states": _shape(text_hidden_states),
+                    "text_hidden_states_device": _device(text_hidden_states),
+                    "actions_hidden_states": _shape(actions_hidden_states),
+                    "actions_hidden_states_device": _device(actions_hidden_states),
+                }
+            )
 
         if use_l1_regression:
             # Predict action,输出的是(B, NUM_ACTIONS_CHUNK, ACTION_DIM)的连续动作=(B,8,7)
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            if debug_batch_shapes:
+                debug_info["predicted_actions"] = _shape(predicted_actions)
+                debug_info["predicted_actions_device"] = _device(predicted_actions)
             # Get full L1 loss,和专家动作的L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
@@ -427,6 +544,8 @@ def run_forward_pass(
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
+        if debug_batch_shapes:
+            metrics.update({f"debug_{key}": value for key, value in debug_info.items()})
 
         # Get detailed L1 losses for logging
         should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
@@ -499,6 +618,11 @@ def run_diffusion_sampling(
 
     # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
     curr_noisy_actions = noise
+    input_ids = batch["input_ids"].to(device_id)
+    attention_mask = batch["attention_mask"].to(device_id)
+    pixel_values = batch["pixel_values"].to(torch.bfloat16).to(device_id)
+    proprio = batch["proprio"].to(device_id).to(torch.bfloat16) if use_proprio else None
+    labels = batch["labels"].to(device_id)
     for t in action_head.module.noise_scheduler.timesteps:
         # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action embedding,
         # and diffusion timestep embedding)
@@ -511,12 +635,12 @@ def run_diffusion_sampling(
         #VLA前向传播
         with torch.autocast("cuda", dtype=torch.bfloat16):
             output = vla(
-                input_ids=batch["input_ids"].to(device_id),
-                attention_mask=batch["attention_mask"].to(device_id),
-                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                labels=labels,
                 output_hidden_states=True,
-                proprio=batch["proprio"] if use_proprio else None,
+                proprio=proprio,
                 proprio_projector=proprio_projector if use_proprio else None,
                 noisy_actions=curr_noisy_actions,
                 noisy_action_projector=noisy_action_projector,
@@ -632,7 +756,7 @@ def save_training_checkpoint(
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
-    dist.barrier()
+    _distributed_barrier()
 
     # Save model components (main process only)
     if distributed_state.is_main_process:
@@ -660,7 +784,7 @@ def save_training_checkpoint(
             )
 
     # Wait for model components to be saved
-    dist.barrier()
+    _distributed_barrier()
 
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
@@ -676,7 +800,7 @@ def save_training_checkpoint(
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
-        dist.barrier()
+        _distributed_barrier()
 
 
 # 在验证集上计算指标
@@ -843,7 +967,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         check_model_logic_mismatch(cfg.vla_path)
 
     # Wait for model files to be synced
-    dist.barrier()
+    _distributed_barrier()
 
     # Load processor and VLA 真正加载模型和处理器
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
@@ -1011,6 +1135,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
+        _print_dataset_statistics(train_dataset.dataset_statistics)
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
     # Create collator and dataloader
@@ -1065,6 +1190,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                debug_batch_shapes=cfg.debug_batch_shapes and batch_idx < cfg.debug_num_batches,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1072,6 +1198,27 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Backward pass
             normalized_loss.backward()
+
+            if (
+                cfg.debug_batch_shapes
+                and distributed_state.is_main_process
+                and batch_idx < cfg.debug_num_batches
+            ):
+                print(f"\n[Debug] Batch {batch_idx} diagnostics:")
+                for key, value in metrics.items():
+                    if key.startswith("debug_"):
+                        print(f"  {key.removeprefix('debug_')}: {value}")
+
+            if cfg.debug_grad_norm and distributed_state.is_main_process and batch_idx < cfg.debug_num_batches:
+                grad_norms = {
+                    "vla": _module_grad_norm(vla),
+                    "action_head": _module_grad_norm(action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None),
+                    "proprio_projector": _module_grad_norm(proprio_projector if cfg.use_proprio else None),
+                    "noisy_action_projector": _module_grad_norm(noisy_action_projector if cfg.use_diffusion else None),
+                }
+                print(f"\n[Debug] Batch {batch_idx} grad norms:")
+                for key, value in grad_norms.items():
+                    print(f"  {key}: {value}")
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
@@ -1101,7 +1248,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
                     {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        "VLA Train/Learning Rate": optimizer.param_groups[0]["lr"],
                     },
                     step=log_step,
                 )

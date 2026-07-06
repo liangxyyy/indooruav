@@ -917,6 +917,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        action_branch_index=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -954,7 +955,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if action_head is not None:
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            if normalized_actions.ndim == 4:
+                if action_branch_index is not None:
+                    normalized_actions = normalized_actions[:, action_branch_index]
+                else:
+                    normalized_actions = normalized_actions[:, 0]
+            normalized_actions = normalized_actions.reshape(-1, NUM_ACTIONS_CHUNK, ACTION_DIM)
+            if normalized_actions.shape[0] == 1:
+                normalized_actions = normalized_actions[0]
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
             # Discrete token-based prediction
@@ -983,6 +991,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         proprio_projector=None,
         action_head=None,
         noisy_action_projector=None,
+        action_branch_index: Optional[int] = 0,
+        return_all_action_branches: bool = False,
         use_film: bool = False,
         **kwargs: str,
     ) -> np.ndarray:
@@ -1084,6 +1094,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                None if return_all_action_branches else action_branch_index,
             )
 
         # Unnormalize predicted actions

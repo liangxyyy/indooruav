@@ -84,9 +84,24 @@ class OpenVLAServer:
 
             observation = payload
             instruction = observation["instruction"]
+            action_branch_index = observation.get("action_branch_index", self.cfg.action_branch_index)
+            if "action_branch_scores" in observation:
+                action_branch_index = int(np.argmax(np.asarray(observation["action_branch_scores"])))
+            return_all_action_branches = observation.get(
+                "return_all_action_branches", self.cfg.return_all_action_branches
+            )
 
             action = get_vla_action(
-                self.cfg, self.vla, self.processor, observation, instruction, action_head=self.action_head, proprio_projector=self.proprio_projector, use_film=self.cfg.use_film,
+                self.cfg,
+                self.vla,
+                self.processor,
+                observation,
+                instruction,
+                action_head=self.action_head,
+                proprio_projector=self.proprio_projector,
+                use_film=self.cfg.use_film,
+                action_branch_index=action_branch_index,
+                return_all_action_branches=return_all_action_branches,
             )
 
             if double_encode:
@@ -125,8 +140,12 @@ class DeployConfig:
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
+    num_action_branches: int = 1                     # Number of supervised action branches in the action head
+    action_branch_index: int = 0                     # Default branch to execute when multiple branches are predicted
+    return_all_action_branches: bool = False         # If True, return all branches instead of selecting one
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
+    use_image_history: bool = True                   # If True, treats multi-image inputs as primary-camera history
     use_proprio: bool = True                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)

@@ -479,7 +479,12 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
 
     # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
-        action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+        action_head = L1RegressionActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+            num_action_branches=getattr(cfg, "num_action_branches", 1),
+        )
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
@@ -722,6 +727,8 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    action_branch_index: Optional[int] = 0,
+    return_all_action_branches: bool = False,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -742,9 +749,19 @@ def get_vla_action(
     """
     with torch.inference_mode():
 
-        # Collect all input images
-        all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
+        # Collect input images. IndoorUAV multi-image inputs are primary-camera history frames.
+        if getattr(cfg, "use_image_history", False):
+            if "full_image_history" in obs:
+                all_images = list(obs["full_image_history"])[-cfg.num_images_in_input :]
+            elif "image_history" in obs:
+                all_images = list(obs["image_history"])[-cfg.num_images_in_input :]
+            else:
+                all_images = [obs["full_image"]] * cfg.num_images_in_input
+            if len(all_images) < cfg.num_images_in_input:
+                all_images = [all_images[0]] * (cfg.num_images_in_input - len(all_images)) + all_images
+        else:
+            all_images = [obs["full_image"]]
+        if cfg.num_images_in_input > 1 and not getattr(cfg, "use_image_history", False):
             all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
 
         # Process images
@@ -791,10 +808,14 @@ def get_vla_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
+                action_branch_index=action_branch_index,
+                return_all_action_branches=return_all_action_branches,
                 use_film=use_film,
             )
 
     # Return action chunk as list of actions
+    if np.asarray(action).ndim == 3:
+        return [[action[k][i] for i in range(len(action[k]))] for k in range(len(action))]
     return [action[i] for i in range(len(action))]
 
 

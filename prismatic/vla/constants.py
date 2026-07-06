@@ -48,7 +48,7 @@ BRIDGE_CONSTANTS = {
 
 # UAV (indoor drone navigation) constants
 UAV_CONSTANTS = {
-    "NUM_ACTIONS_CHUNK": 1,
+    "NUM_ACTIONS_CHUNK": 5,
     "ACTION_DIM": 4,
     "PROPRIO_DIM": 4,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,

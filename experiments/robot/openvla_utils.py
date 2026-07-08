@@ -278,32 +278,52 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         update_auto_map(cfg.pretrained_checkpoint)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
-    # Load the model
+    # Load the model directly onto the target device for inference. Loading on CPU
+    # and then calling `vla.to(cuda)` can hang for the 7B checkpoint on this setup.
+    from_pretrained_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "load_in_8bit": cfg.load_in_8bit,
+        "load_in_4bit": cfg.load_in_4bit,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if not cfg.load_in_8bit and not cfg.load_in_4bit:
+        from_pretrained_kwargs["device_map"] = {"": DEVICE}
+
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
         # attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
+        **from_pretrained_kwargs,
     )
+    print("VLA base checkpoint loaded.", flush=True)
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
+        print("Applying FiLM wrapper...", flush=True)
         vla = _apply_film_to_vla(vla, cfg)
+        print("FiLM wrapper applied.", flush=True)
 
     # Set number of images in model input
+    print(f"Setting num_images_in_input={cfg.num_images_in_input}...", flush=True)
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
+    print("Setting VLA eval mode...", flush=True)
     vla.eval()
 
-    # Move model to device if not using quantization
+    # Move model to device if not using quantization and it was not already loaded there.
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
-        vla = vla.to(DEVICE)
+        first_param_device = next(vla.parameters()).device
+        if first_param_device != torch.device(DEVICE):
+            print(f"Moving VLA model to {DEVICE}...", flush=True)
+            vla = vla.to(DEVICE)
+            print(f"VLA model moved to {DEVICE}.", flush=True)
+        else:
+            print(f"VLA model already loaded on {DEVICE}.", flush=True)
 
     # Load dataset stats for action normalization
+    print("Loading VLA dataset statistics...", flush=True)
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+    print("VLA dataset statistics loaded.", flush=True)
 
     return vla
 

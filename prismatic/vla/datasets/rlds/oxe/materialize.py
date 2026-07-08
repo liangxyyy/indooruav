@@ -44,9 +44,9 @@ def make_oxe_dataset_kwargs(
         dataset_kwargs["absolute_action_mask"] = [True] * 14
         dataset_kwargs["action_normalization_mask"] = [True] * 14
 
-    # [indoor_uav] All 4 action dimensions (dx, dy, dz, dyaw) are relative (delta) =>> all False
+    # [indoor_uav] Actions are future absolute UAV states: (x, y, z, yaw).
     if "indoor_uav" in dataset_name:
-        dataset_kwargs["absolute_action_mask"] = [False] * 4
+        dataset_kwargs["absolute_action_mask"] = [True] * 4
         dataset_kwargs["action_normalization_mask"] = [True] * 4
     dataset_kwargs["action_proprio_normalization_type"] = action_proprio_normalization_type
 

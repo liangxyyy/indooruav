@@ -153,16 +153,12 @@ def _wrapped_abs_yaw_error(pred_yaw: torch.Tensor, target_yaw: torch.Tensor) -> 
     return diff.abs()
 
 
-def compute_offline_branch_rewards(
+def compute_offline_branch_reward_tensors(
     predicted_actions: torch.Tensor,
     ground_truth_actions: torch.Tensor,
     action_norm_stats: Optional[dict],
-) -> Dict[str, float]:
-    """
-    Computes offline reward diagnostics in real pose units.
-
-    This only logs reward-like metrics. It does not participate in the training loss yet.
-    """
+) -> Dict[str, torch.Tensor]:
+    """Computes offline branch reward tensors in real pose units."""
     with torch.no_grad():
         if predicted_actions.ndim == 3:
             predicted_actions = predicted_actions.unsqueeze(1)
@@ -186,6 +182,39 @@ def compute_offline_branch_rewards(
             -0.10 * traj_yaw_error
             -2.00 * z_below_zero_rate
         )
+
+        return {
+            "rewards": rewards,
+            "final_pos_error": final_pos_error,
+            "final_yaw_error": final_yaw_error,
+            "traj_pos_error": traj_pos_error,
+            "traj_yaw_error": traj_yaw_error,
+            "z_below_zero_rate": z_below_zero_rate,
+            "success": success.float(),
+        }
+
+
+def compute_offline_branch_rewards(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    action_norm_stats: Optional[dict],
+) -> Dict[str, float]:
+    """
+    Computes offline reward diagnostics in real pose units.
+
+    This only logs reward-like metrics. It does not participate in the training loss yet.
+    """
+    with torch.no_grad():
+        reward_tensors = compute_offline_branch_reward_tensors(
+            predicted_actions, ground_truth_actions, action_norm_stats
+        )
+        rewards = reward_tensors["rewards"]
+        final_pos_error = reward_tensors["final_pos_error"]
+        final_yaw_error = reward_tensors["final_yaw_error"]
+        traj_pos_error = reward_tensors["traj_pos_error"]
+        traj_yaw_error = reward_tensors["traj_yaw_error"]
+        z_below_zero_rate = reward_tensors["z_below_zero_rate"]
+        success = reward_tensors["success"]
         best_rewards, best_branches = rewards.max(dim=1)
 
         reward_metrics = {
@@ -205,6 +234,46 @@ def compute_offline_branch_rewards(
             reward_metrics[f"offline_branch{branch_idx}_final_pos_error"] = final_pos_error[:, branch_idx].mean().item()
 
         return reward_metrics
+
+
+def compute_grpo_branch_loss(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    action_norm_stats: Optional[dict],
+    advantage_eps: float,
+    advantage_clip: float,
+    policy_sigma: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Computes a GRPO-style loss for deterministic continuous action branches.
+
+    Rewards are detached and converted to group-relative advantages across branches. The branch policy surrogate uses
+    a fixed-variance Gaussian log-likelihood around the ground-truth normalized action chunk.
+    """
+    if predicted_actions.ndim != 4:
+        raise ValueError("GRPO branch loss requires predicted_actions with shape (B, branches, T, action_dim)")
+
+    reward_tensors = compute_offline_branch_reward_tensors(predicted_actions, ground_truth_actions, action_norm_stats)
+    rewards = reward_tensors["rewards"]
+    reward_mean = rewards.mean(dim=1, keepdim=True)
+    reward_std = rewards.std(dim=1, keepdim=True, unbiased=False)
+    advantages = (rewards - reward_mean) / (reward_std + advantage_eps)
+    advantages = advantages.clamp(min=-advantage_clip, max=advantage_clip).detach()
+
+    branch_targets = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
+    per_branch_mse = ((predicted_actions.float() - branch_targets.float()) ** 2).mean(dim=(2, 3))
+    gaussian_nll = per_branch_mse / (2.0 * policy_sigma * policy_sigma)
+    grpo_loss = (advantages * gaussian_nll).mean()
+
+    best_branch = rewards.argmax(dim=1).float()
+    metrics = {
+        "grpo_loss": grpo_loss.item(),
+        "grpo_advantage_mean": advantages.mean().item(),
+        "grpo_advantage_std": advantages.std(unbiased=False).item(),
+        "grpo_policy_mse": per_branch_mse.mean().item(),
+        "grpo_best_branch_mean": best_branch.mean().item(),
+    }
+    return grpo_loss, metrics
 
 
 def _distributed_is_initialized() -> bool:
@@ -246,6 +315,10 @@ class FinetuneConfig:
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
     branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
+    grpo_reward_weight: float = 0.0                  # Weight for GRPO-style branch reward optimization
+    grpo_policy_sigma: float = 1.0                   # Fixed Gaussian sigma for continuous-action GRPO surrogate
+    grpo_advantage_eps: float = 1e-4                 # Numerical stability constant for group advantage normalization
+    grpo_advantage_clip: float = 5.0                 # Clips group-relative advantages before applying GRPO loss
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_image_history: bool = False                  # If True, uses num_images_in_input primary-camera history frames
@@ -457,6 +530,10 @@ def run_forward_pass(
     num_action_branches,
     branch_diversity_weight,
     branch_diversity_margin,
+    grpo_reward_weight,
+    grpo_policy_sigma,
+    grpo_advantage_eps,
+    grpo_advantage_clip,
     use_proprio,
     use_film,
     num_patches,
@@ -639,6 +716,17 @@ def run_forward_pass(
                         "branch_mean_distance": branch_mean_distance.item(),
                     }
                 )
+            if predicted_actions.ndim == 4 and grpo_reward_weight > 0:
+                grpo_loss, grpo_metrics = compute_grpo_branch_loss(
+                    predicted_actions=predicted_actions,
+                    ground_truth_actions=ground_truth_actions,
+                    action_norm_stats=action_norm_stats,
+                    advantage_eps=grpo_advantage_eps,
+                    advantage_clip=grpo_advantage_clip,
+                    policy_sigma=grpo_policy_sigma,
+                )
+                loss = loss + grpo_reward_weight * grpo_loss
+                metrics.update(grpo_metrics)
 
         if use_diffusion:
             # Predict noise
@@ -998,6 +1086,10 @@ def run_validation(
                 num_action_branches=cfg.num_action_branches,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
+                grpo_reward_weight=cfg.grpo_reward_weight,
+                grpo_policy_sigma=cfg.grpo_policy_sigma,
+                grpo_advantage_eps=cfg.grpo_advantage_eps,
+                grpo_advantage_clip=cfg.grpo_advantage_clip,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
@@ -1058,6 +1150,16 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("branch_diversity_weight must be >= 0")
     if cfg.branch_diversity_margin < 0:
         raise ValueError("branch_diversity_margin must be >= 0")
+    if cfg.grpo_reward_weight < 0:
+        raise ValueError("grpo_reward_weight must be >= 0")
+    if cfg.grpo_reward_weight > 0 and cfg.num_action_branches < 2:
+        raise ValueError("grpo_reward_weight > 0 requires num_action_branches >= 2")
+    if cfg.grpo_policy_sigma <= 0:
+        raise ValueError("grpo_policy_sigma must be > 0")
+    if cfg.grpo_advantage_eps <= 0:
+        raise ValueError("grpo_advantage_eps must be > 0")
+    if cfg.grpo_advantage_clip <= 0:
+        raise ValueError("grpo_advantage_clip must be > 0")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -1334,6 +1436,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
+        "grpo_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "grpo_advantage_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "grpo_advantage_std": deque(maxlen=cfg.grad_accumulation_steps),
+        "grpo_policy_mse": deque(maxlen=cfg.grad_accumulation_steps),
+        "grpo_best_branch_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "offline_reward_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "offline_reward_best": deque(maxlen=cfg.grad_accumulation_steps),
         "offline_best_branch_mean": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1368,6 +1475,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_action_branches=cfg.num_action_branches,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
+                grpo_reward_weight=cfg.grpo_reward_weight,
+                grpo_policy_sigma=cfg.grpo_policy_sigma,
+                grpo_advantage_eps=cfg.grpo_advantage_eps,
+                grpo_advantage_clip=cfg.grpo_advantage_clip,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,

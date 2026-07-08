@@ -114,6 +114,99 @@ def _print_dataset_statistics(dataset_statistics: dict) -> None:
                 print(f"    {key}: {stats[key]}")
 
 
+def _get_action_norm_stats(dataset_statistics: dict, dataset_name: str) -> Optional[dict]:
+    if not dataset_statistics:
+        return None
+    if dataset_name in dataset_statistics:
+        return dataset_statistics[dataset_name].get("action")
+    if len(dataset_statistics) == 1:
+        return next(iter(dataset_statistics.values())).get("action")
+    return None
+
+
+def _stats_tensor(values, device, dtype=torch.float32) -> torch.Tensor:
+    return torch.as_tensor(values, device=device, dtype=dtype)
+
+
+def _unnormalize_actions_for_reward(actions: torch.Tensor, action_norm_stats: Optional[dict]) -> torch.Tensor:
+    """Convert normalized action/state predictions back to real units for offline reward metrics."""
+    actions = actions.float()
+    if action_norm_stats is None:
+        return actions
+
+    if "q01" in action_norm_stats and "q99" in action_norm_stats:
+        action_low = _stats_tensor(action_norm_stats["q01"], actions.device)
+        action_high = _stats_tensor(action_norm_stats["q99"], actions.device)
+    elif "min" in action_norm_stats and "max" in action_norm_stats:
+        action_low = _stats_tensor(action_norm_stats["min"], actions.device)
+        action_high = _stats_tensor(action_norm_stats["max"], actions.device)
+    else:
+        return actions
+
+    mask = _stats_tensor(action_norm_stats.get("mask", [True] * actions.shape[-1]), actions.device, torch.bool)
+    unnormalized = 0.5 * (actions + 1.0) * (action_high - action_low + 1e-8) + action_low
+    return torch.where(mask, unnormalized, actions)
+
+
+def _wrapped_abs_yaw_error(pred_yaw: torch.Tensor, target_yaw: torch.Tensor) -> torch.Tensor:
+    diff = torch.remainder(pred_yaw - target_yaw + torch.pi, 2 * torch.pi) - torch.pi
+    return diff.abs()
+
+
+def compute_offline_branch_rewards(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    action_norm_stats: Optional[dict],
+) -> Dict[str, float]:
+    """
+    Computes offline reward diagnostics in real pose units.
+
+    This only logs reward-like metrics. It does not participate in the training loss yet.
+    """
+    with torch.no_grad():
+        if predicted_actions.ndim == 3:
+            predicted_actions = predicted_actions.unsqueeze(1)
+
+        pred = _unnormalize_actions_for_reward(predicted_actions.detach(), action_norm_stats)
+        target = _unnormalize_actions_for_reward(ground_truth_actions.detach(), action_norm_stats).unsqueeze(1)
+
+        pos_error = torch.linalg.vector_norm(pred[..., :3] - target[..., :3], dim=-1)
+        yaw_error = _wrapped_abs_yaw_error(pred[..., 3], target[..., 3])
+        final_pos_error = pos_error[..., -1]
+        final_yaw_error = yaw_error[..., -1]
+        traj_pos_error = pos_error.mean(dim=-1)
+        traj_yaw_error = yaw_error.mean(dim=-1)
+        z_below_zero_rate = (pred[..., 2] < 0).float().mean(dim=-1)
+        success = (final_pos_error < 0.5) & (final_yaw_error < torch.pi / 4)
+
+        rewards = (
+            -final_pos_error
+            -0.25 * final_yaw_error
+            -0.50 * traj_pos_error
+            -0.10 * traj_yaw_error
+            -2.00 * z_below_zero_rate
+        )
+        best_rewards, best_branches = rewards.max(dim=1)
+
+        reward_metrics = {
+            "offline_reward_mean": rewards.mean().item(),
+            "offline_reward_best": best_rewards.mean().item(),
+            "offline_best_branch_mean": best_branches.float().mean().item(),
+            "offline_final_pos_error": final_pos_error.mean().item(),
+            "offline_final_yaw_error": final_yaw_error.mean().item(),
+            "offline_traj_pos_error": traj_pos_error.mean().item(),
+            "offline_traj_yaw_error": traj_yaw_error.mean().item(),
+            "offline_z_below_zero_rate": z_below_zero_rate.mean().item(),
+            "offline_success_rate": success.float().mean().item(),
+        }
+
+        for branch_idx in range(rewards.shape[1]):
+            reward_metrics[f"offline_branch{branch_idx}_reward"] = rewards[:, branch_idx].mean().item()
+            reward_metrics[f"offline_branch{branch_idx}_final_pos_error"] = final_pos_error[:, branch_idx].mean().item()
+
+        return reward_metrics
+
+
 def _distributed_is_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -367,6 +460,7 @@ def run_forward_pass(
     use_proprio,
     use_film,
     num_patches,
+    action_norm_stats=None,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     debug_batch_shapes=False,
@@ -601,6 +695,9 @@ def run_forward_pass(
                 per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(2, 3))
                 l1_metrics["all_branches_l1_loss"] = per_branch_l1.mean().item()
                 l1_metrics["best_branch_l1_loss"] = per_branch_l1.min(dim=1).values.mean().item()
+                l1_metrics.update(
+                    compute_offline_branch_rewards(predicted_actions, ground_truth_actions, action_norm_stats)
+                )
             metrics.update(l1_metrics)
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)，其中loss是用来反向传播的，metrics是用来记录日志的
@@ -856,6 +953,7 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    action_norm_stats=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -903,6 +1001,7 @@ def run_validation(
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
+                action_norm_stats=action_norm_stats,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1201,6 +1300,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         _print_dataset_statistics(train_dataset.dataset_statistics)
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
+    action_norm_stats = _get_action_norm_stats(train_dataset.dataset_statistics, cfg.dataset_name)
 
     # Create collator and dataloader
     collator = PaddedCollatorForActionPrediction(
@@ -1234,6 +1334,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_reward_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_reward_best": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_best_branch_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_final_pos_error": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_final_yaw_error": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_traj_pos_error": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_traj_yaw_error": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_z_below_zero_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_success_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_branch0_reward": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_branch1_reward": deque(maxlen=cfg.grad_accumulation_steps),
+        "offline_branch2_reward": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training 真正开始训练（核心）
@@ -1259,6 +1371,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
+                action_norm_stats=action_norm_stats,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 debug_batch_shapes=cfg.debug_batch_shapes and batch_idx < cfg.debug_num_batches,
@@ -1365,6 +1478,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    action_norm_stats=action_norm_stats,
                 )
                 # Set model back to training mode after validation
                 vla.train()

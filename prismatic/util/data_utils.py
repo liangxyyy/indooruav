@@ -113,6 +113,10 @@ class PaddedCollatorForActionPrediction:
             )
         else:
             image_history_pad_mask = None
+        if "future_pixel_values" in instances[0]:
+            future_pixel_values = torch.stack([instance["future_pixel_values"] for instance in instances])
+        else:
+            future_pixel_values = None
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -162,4 +166,6 @@ class PaddedCollatorForActionPrediction:
             output["dataset_names"] = dataset_names
         if image_history_pad_mask is not None:
             output["image_history_pad_mask"] = image_history_pad_mask
+        if future_pixel_values is not None:
+            output["future_pixel_values"] = future_pixel_values
         return output

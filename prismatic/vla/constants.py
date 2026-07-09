@@ -110,6 +110,26 @@ ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
 
+
+def get_cond_token(time_idx: int, branch_idx: int) -> str:
+    """Returns the condition placeholder token for 1-indexed timestep/branch IDs."""
+    return f"<COND_{time_idx}_{branch_idx}>"
+
+
+def get_act_token(time_idx: int, branch_idx: int) -> str:
+    """Returns the action placeholder token for 1-indexed timestep/branch IDs."""
+    return f"<ACT_{time_idx}_{branch_idx}>"
+
+
+def get_cond_action_tokens(num_actions_chunk: int = None, num_action_branches: int = 3):
+    """Returns all COND/ACT placeholder tokens in canonical time-major order."""
+    num_actions_chunk = num_actions_chunk or NUM_ACTIONS_CHUNK
+    tokens = []
+    for time_idx in range(1, num_actions_chunk + 1):
+        for branch_idx in range(1, num_action_branches + 1):
+            tokens.extend([get_cond_token(time_idx, branch_idx), get_act_token(time_idx, branch_idx)])
+    return tokens
+
 # Print which robot platform constants are being used (for debugging)
 print(f"Using {ROBOT_PLATFORM} constants:")
 print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")

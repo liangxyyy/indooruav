@@ -21,7 +21,17 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
 from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+from prismatic.vla.constants import (
+    ACTION_DIM,
+    ACTION_PROPRIO_NORMALIZATION_TYPE,
+    ACTION_TOKEN_BEGIN_IDX,
+    IGNORE_INDEX,
+    NUM_ACTIONS_CHUNK,
+    PROPRIO_DIM,
+    STOP_INDEX,
+    get_act_token,
+    get_cond_token,
+)
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
@@ -40,6 +50,15 @@ class RLDSBatchTransform:
     use_image_history: bool = False
     num_images_in_input: int = 1
     require_full_image_history: bool = False
+    use_cond_action_tokens: bool = False
+    num_action_branches: int = 1
+
+    def _build_cond_action_string(self) -> str:
+        tokens = []
+        for time_idx in range(1, NUM_ACTIONS_CHUNK + 1):
+            for branch_idx in range(1, self.num_action_branches + 1):
+                tokens.extend([get_cond_token(time_idx, branch_idx), get_act_token(time_idx, branch_idx)])
+        return "".join(tokens)
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -66,14 +85,18 @@ class RLDSBatchTransform:
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
-        # Get future action chunk
-        future_actions = action_chunk[1:]
-        future_actions_string = ''.join(self.action_tokenizer(future_actions))
+        if self.use_cond_action_tokens:
+            action_chunk_string = self._build_cond_action_string()
+            action_chunk_len = 0
+        else:
+            # Get future action chunk
+            future_actions = action_chunk[1:]
+            future_actions_string = ''.join(self.action_tokenizer(future_actions))
 
-        # Get action chunk string
-        current_action_string = self.action_tokenizer(current_action)
-        action_chunk_string = current_action_string + future_actions_string
-        action_chunk_len = len(action_chunk_string)
+            # Get action chunk string
+            current_action_string = self.action_tokenizer(current_action)
+            action_chunk_string = current_action_string + future_actions_string
+            action_chunk_len = len(action_chunk_string)
 
         conversation = [
             {"from": "human", "value": f"What action should the robot take to {lang}?"},
@@ -90,8 +113,11 @@ class RLDSBatchTransform:
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
 
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
+        if self.use_cond_action_tokens:
+            labels[:] = IGNORE_INDEX
+        else:
+            # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
+            labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
@@ -111,6 +137,12 @@ class RLDSBatchTransform:
             return_dict["proprio"] = proprio
         if self.use_image_history:
             return_dict["image_history_pad_mask"] = rlds_batch["observation"].get("pad_mask")
+        if self.use_cond_action_tokens and "future_observation" in rlds_batch:
+            future_images = rlds_batch["future_observation"]["image_primary"][:NUM_ACTIONS_CHUNK]
+            return_dict["future_pixel_values"] = torch.stack(
+                [self.image_transform(Image.fromarray(image)) for image in future_images],
+                dim=0,
+            )
 
         return return_dict
 

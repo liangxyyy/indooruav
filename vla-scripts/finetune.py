@@ -57,6 +57,9 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
+    get_act_token,
+    get_cond_action_tokens,
+    get_cond_token,
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
@@ -128,6 +131,60 @@ def _stats_tensor(values, device, dtype=torch.float32) -> torch.Tensor:
     return torch.as_tensor(values, device=device, dtype=dtype)
 
 
+def add_cond_action_tokens(tokenizer, model, num_action_branches: int) -> None:
+    tokens = get_cond_action_tokens(NUM_ACTIONS_CHUNK, num_action_branches)
+    num_added = tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+    if num_added > 0:
+        model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+    print(f"COND/ACT special tokens ready: {len(tokens)} tokens ({num_added} newly added)")
+
+
+def get_cond_action_token_id_tensors(tokenizer, num_action_branches: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    cond_ids = []
+    act_ids = []
+    for time_idx in range(1, NUM_ACTIONS_CHUNK + 1):
+        for branch_idx in range(1, num_action_branches + 1):
+            cond_ids.append(tokenizer.convert_tokens_to_ids(get_cond_token(time_idx, branch_idx)))
+            act_ids.append(tokenizer.convert_tokens_to_ids(get_act_token(time_idx, branch_idx)))
+    return (
+        torch.tensor(cond_ids, device=device, dtype=torch.long),
+        torch.tensor(act_ids, device=device, dtype=torch.long),
+    )
+
+
+def gather_cond_action_hidden_states(
+    text_hidden_states: torch.Tensor,
+    shifted_input_ids: torch.Tensor,
+    cond_token_ids: torch.Tensor,
+    act_token_ids: torch.Tensor,
+    num_action_branches: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    cond_mask = torch.isin(shifted_input_ids, cond_token_ids)
+    act_mask = torch.isin(shifted_input_ids, act_token_ids)
+    batch_size = shifted_input_ids.shape[0]
+    expected_count = NUM_ACTIONS_CHUNK * num_action_branches
+    cond_counts = cond_mask.sum(dim=1)
+    act_counts = act_mask.sum(dim=1)
+    if not torch.all(cond_counts == expected_count) or not torch.all(act_counts == expected_count):
+        raise ValueError(
+            "Incomplete COND/ACT token structure: "
+            f"expected {expected_count}, cond_counts={cond_counts.tolist()}, act_counts={act_counts.tolist()}"
+        )
+
+    cond_hidden = text_hidden_states[cond_mask].reshape(
+        batch_size, NUM_ACTIONS_CHUNK, num_action_branches, -1
+    )
+    act_hidden = text_hidden_states[act_mask].reshape(
+        batch_size, NUM_ACTIONS_CHUNK, num_action_branches, -1
+    )
+    format_metrics = {
+        "format_cond_token_count": cond_counts.float().mean().item(),
+        "format_act_token_count": act_counts.float().mean().item(),
+        "format_complete_rate": ((cond_counts == expected_count) & (act_counts == expected_count)).float().mean().item(),
+    }
+    return cond_hidden, act_hidden, format_metrics
+
+
 def _unnormalize_actions_for_reward(actions: torch.Tensor, action_norm_stats: Optional[dict]) -> torch.Tensor:
     """Convert normalized action/state predictions back to real units for offline reward metrics."""
     actions = actions.float()
@@ -161,18 +218,18 @@ def compute_offline_branch_reward_tensors(
     """Computes offline branch reward tensors in real pose units."""
     with torch.no_grad():
         if predicted_actions.ndim == 3:
-            predicted_actions = predicted_actions.unsqueeze(1)
+            predicted_actions = predicted_actions.unsqueeze(2)
 
         pred = _unnormalize_actions_for_reward(predicted_actions.detach(), action_norm_stats)
-        target = _unnormalize_actions_for_reward(ground_truth_actions.detach(), action_norm_stats).unsqueeze(1)
+        target = _unnormalize_actions_for_reward(ground_truth_actions.detach(), action_norm_stats).unsqueeze(2)
 
         pos_error = torch.linalg.vector_norm(pred[..., :3] - target[..., :3], dim=-1)
         yaw_error = _wrapped_abs_yaw_error(pred[..., 3], target[..., 3])
-        final_pos_error = pos_error[..., -1]
-        final_yaw_error = yaw_error[..., -1]
-        traj_pos_error = pos_error.mean(dim=-1)
-        traj_yaw_error = yaw_error.mean(dim=-1)
-        z_below_zero_rate = (pred[..., 2] < 0).float().mean(dim=-1)
+        final_pos_error = pos_error[:, -1, :]
+        final_yaw_error = yaw_error[:, -1, :]
+        traj_pos_error = pos_error.mean(dim=1)
+        traj_yaw_error = yaw_error.mean(dim=1)
+        z_below_zero_rate = (pred[..., 2] < 0).float().mean(dim=1)
         success = (final_pos_error < 0.5) & (final_yaw_error < torch.pi / 4)
 
         rewards = (
@@ -251,7 +308,7 @@ def compute_grpo_branch_loss(
     a fixed-variance Gaussian log-likelihood around the ground-truth normalized action chunk.
     """
     if predicted_actions.ndim != 4:
-        raise ValueError("GRPO branch loss requires predicted_actions with shape (B, branches, T, action_dim)")
+        raise ValueError("GRPO branch loss requires predicted_actions with shape (B, T, branches, action_dim)")
 
     reward_tensors = compute_offline_branch_reward_tensors(predicted_actions, ground_truth_actions, action_norm_stats)
     rewards = reward_tensors["rewards"]
@@ -260,8 +317,8 @@ def compute_grpo_branch_loss(
     advantages = (rewards - reward_mean) / (reward_std + advantage_eps)
     advantages = advantages.clamp(min=-advantage_clip, max=advantage_clip).detach()
 
-    branch_targets = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
-    per_branch_mse = ((predicted_actions.float() - branch_targets.float()) ** 2).mean(dim=(2, 3))
+    branch_targets = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+    per_branch_mse = ((predicted_actions.float() - branch_targets.float()) ** 2).mean(dim=(1, 3))
     gaussian_nll = per_branch_mse / (2.0 * policy_sigma * policy_sigma)
     grpo_loss = (advantages * gaussian_nll).mean()
 
@@ -313,6 +370,7 @@ class FinetuneConfig:
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
+    use_cond_action_tokens: bool = False             # If True, use explicit T x K COND/ACT placeholder tokens
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
     branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
     grpo_reward_weight: float = 0.0                  # Weight for GRPO-style branch reward optimization
@@ -538,6 +596,9 @@ def run_forward_pass(
     use_film,
     num_patches,
     action_norm_stats=None,
+    use_cond_action_tokens=False,
+    cond_token_ids=None,
+    act_token_ids=None,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     debug_batch_shapes=False,
@@ -573,6 +634,9 @@ def run_forward_pass(
     input_ids = batch["input_ids"].to(device_id)
     attention_mask = batch["attention_mask"].to(device_id)
     pixel_values = batch["pixel_values"].to(torch.bfloat16).to(device_id)
+    future_pixel_values = batch.get("future_pixel_values")
+    if future_pixel_values is not None:
+        future_pixel_values = future_pixel_values.to(torch.bfloat16).to(device_id)
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
     proprio = batch["proprio"].to(device_id).to(torch.bfloat16) if use_proprio else None
     labels = batch["labels"].to(device_id)
@@ -609,6 +673,7 @@ def run_forward_pass(
     ground_truth_token_ids = labels[:, 1:]
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+    shifted_input_ids = input_ids[:, 1:]
     if debug_batch_shapes:
         debug_info.update(
             {
@@ -618,6 +683,8 @@ def run_forward_pass(
                 "attention_mask_device": _device(attention_mask),
                 "pixel_values": _shape(pixel_values),
                 "pixel_values_device": _device(pixel_values),
+                "future_pixel_values": _shape(future_pixel_values),
+                "future_pixel_values_device": _device(future_pixel_values),
                 "proprio": _shape(proprio),
                 "proprio_device": _device(proprio),
                 "labels": _shape(labels),
@@ -668,11 +735,23 @@ def run_forward_pass(
         text_hidden_states = last_hidden_states[:, num_patches:-1]
         # Get hidden states for action portion of response
         batch_size = input_ids.shape[0]
-        actions_hidden_states = (
-            text_hidden_states[current_action_mask | next_actions_mask]
-            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-            .to(torch.bfloat16)
-        )  # (B, act_chunk_len, D)=(B,56,D)        act_chunk_len=NUM_ACTIONS_CHUNK * ACTION_DIM=8*7=56
+        if use_cond_action_tokens:
+            cond_hidden_states, actions_hidden_states, format_metrics = gather_cond_action_hidden_states(
+                text_hidden_states=text_hidden_states,
+                shifted_input_ids=shifted_input_ids,
+                cond_token_ids=cond_token_ids,
+                act_token_ids=act_token_ids,
+                num_action_branches=num_action_branches,
+            )
+            metrics.update(format_metrics)
+            actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
+        else:
+            cond_hidden_states = None
+            actions_hidden_states = (
+                text_hidden_states[current_action_mask | next_actions_mask]
+                .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+                .to(torch.bfloat16)
+            )  # (B, act_chunk_len, D)=(B,56,D)        act_chunk_len=NUM_ACTIONS_CHUNK * ACTION_DIM=8*7=56
         if debug_batch_shapes:
             debug_info.update(
                 {
@@ -680,6 +759,7 @@ def run_forward_pass(
                     "last_hidden_states_device": _device(last_hidden_states),
                     "text_hidden_states": _shape(text_hidden_states),
                     "text_hidden_states_device": _device(text_hidden_states),
+                    "cond_hidden_states": _shape(cond_hidden_states),
                     "actions_hidden_states": _shape(actions_hidden_states),
                     "actions_hidden_states_device": _device(actions_hidden_states),
                 }
@@ -693,17 +773,17 @@ def run_forward_pass(
                 debug_info["predicted_actions_device"] = _device(predicted_actions)
             # Get full L1 loss,和专家动作的L1 loss
             if num_action_branches > 1:
-                ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
+                ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
             else:
                 ground_truth_actions_for_loss = ground_truth_actions
             loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
             if predicted_actions.ndim == 4 and branch_diversity_weight > 0:
                 branch_pair_distances = []
-                for left_branch in range(predicted_actions.shape[1]):
-                    for right_branch in range(left_branch + 1, predicted_actions.shape[1]):
+                for left_branch in range(predicted_actions.shape[2]):
+                    for right_branch in range(left_branch + 1, predicted_actions.shape[2]):
                         branch_pair_distances.append(
                             torch.abs(
-                                predicted_actions[:, left_branch] - predicted_actions[:, right_branch]
+                                predicted_actions[:, :, left_branch] - predicted_actions[:, :, right_branch]
                             ).mean(dim=(1, 2))
                         )
                 branch_pair_distances = torch.stack(branch_pair_distances, dim=1)
@@ -766,7 +846,7 @@ def run_forward_pass(
         # Get detailed L1 losses for logging
         should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
-            predicted_actions_for_metrics = predicted_actions[:, 0] if predicted_actions.ndim == 4 else predicted_actions
+            predicted_actions_for_metrics = predicted_actions[:, :, 0] if predicted_actions.ndim == 4 else predicted_actions
             #分开的原因是：第一步动作最直接影响当前控制，未来动作更多是为了规划，当前动作更重要，所以单独算
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions_for_metrics[:, 0]
@@ -779,8 +859,8 @@ def run_forward_pass(
                 "next_actions_l1_loss": next_actions_l1_loss.item(),
             }
             if predicted_actions.ndim == 4:
-                branch_targets = ground_truth_actions.unsqueeze(1).expand_as(predicted_actions)
-                per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(2, 3))
+                branch_targets = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+                per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(1, 3))
                 l1_metrics["all_branches_l1_loss"] = per_branch_l1.mean().item()
                 l1_metrics["best_branch_l1_loss"] = per_branch_l1.min(dim=1).values.mean().item()
                 l1_metrics.update(
@@ -1016,6 +1096,8 @@ def save_training_checkpoint(
         base_vla = AutoModelForVision2Seq.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
+        if cfg.use_cond_action_tokens:
+            base_vla.resize_token_embeddings(len(processor.tokenizer), pad_to_multiple_of=64)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
 
@@ -1042,6 +1124,8 @@ def run_validation(
     distributed_state,
     val_time_limit,
     action_norm_stats=None,
+    cond_token_ids=None,
+    act_token_ids=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -1094,6 +1178,9 @@ def run_validation(
                 use_film=cfg.use_film,
                 num_patches=num_patches,
                 action_norm_stats=action_norm_stats,
+                use_cond_action_tokens=cfg.use_cond_action_tokens,
+                cond_token_ids=cond_token_ids,
+                act_token_ids=act_token_ids,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1146,6 +1233,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
         raise ValueError("num_action_branches > 1 is currently supported only with use_l1_regression=True")
+    if cfg.use_cond_action_tokens and not cfg.use_l1_regression:
+        raise ValueError("use_cond_action_tokens currently requires use_l1_regression=True")
+    if cfg.use_cond_action_tokens and cfg.use_diffusion:
+        raise ValueError("use_cond_action_tokens is not yet implemented for diffusion")
     if cfg.branch_diversity_weight < 0:
         raise ValueError("branch_diversity_weight must be >= 0")
     if cfg.branch_diversity_margin < 0:
@@ -1228,6 +1319,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    if cfg.use_cond_action_tokens:
+        add_cond_action_tokens(processor.tokenizer, vla, cfg.num_action_branches)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1286,6 +1379,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "hidden_dim": vla.module.llm_dim,
                 "action_dim": ACTION_DIM,
                 "num_action_branches": cfg.num_action_branches,
+                "use_cond_action_tokens": cfg.use_cond_action_tokens,
             },
             to_bf16=True,
         )
@@ -1376,6 +1470,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_image_history=cfg.use_image_history,
         num_images_in_input=cfg.num_images_in_input,
         require_full_image_history=cfg.require_full_image_history,
+        use_cond_action_tokens=cfg.use_cond_action_tokens,
+        num_action_branches=cfg.num_action_branches,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1403,6 +1499,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         _print_dataset_statistics(train_dataset.dataset_statistics)
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
     action_norm_stats = _get_action_norm_stats(train_dataset.dataset_statistics, cfg.dataset_name)
+    if cfg.use_cond_action_tokens:
+        cond_token_ids, act_token_ids = get_cond_action_token_id_tensors(
+            processor.tokenizer, cfg.num_action_branches, device_id
+        )
+    else:
+        cond_token_ids, act_token_ids = None, None
 
     # Create collator and dataloader
     collator = PaddedCollatorForActionPrediction(
@@ -1436,6 +1538,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
+        "format_cond_token_count": deque(maxlen=cfg.grad_accumulation_steps),
+        "format_act_token_count": deque(maxlen=cfg.grad_accumulation_steps),
+        "format_complete_rate": deque(maxlen=cfg.grad_accumulation_steps),
         "grpo_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "grpo_advantage_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "grpo_advantage_std": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1483,6 +1588,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 action_norm_stats=action_norm_stats,
+                use_cond_action_tokens=cfg.use_cond_action_tokens,
+                cond_token_ids=cond_token_ids,
+                act_token_ids=act_token_ids,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 debug_batch_shapes=cfg.debug_batch_shapes and batch_idx < cfg.debug_num_batches,
@@ -1590,6 +1698,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
                     action_norm_stats=action_norm_stats,
+                    cond_token_ids=cond_token_ids,
+                    act_token_ids=act_token_ids,
                 )
                 # Set model back to training mode after validation
                 vla.train()

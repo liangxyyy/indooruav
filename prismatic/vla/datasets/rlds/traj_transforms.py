@@ -42,9 +42,19 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     goal_timestep = tf.fill([effective_traj_len], traj_len - 1)
 
     floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
+    future_obs_indices = tf.broadcast_to(
+        tf.range(1, 2 + future_action_window_size),
+        [effective_traj_len, future_action_window_size + 1],
+    ) + tf.broadcast_to(
+        tf.range(effective_traj_len)[:, None],
+        [effective_traj_len, future_action_window_size + 1],
+    )
+    floored_future_obs_indices = tf.minimum(tf.maximum(future_obs_indices, 0), goal_timestep[:, None])
+    future_observation = tf.nest.map_structure(lambda x: tf.gather(x, floored_future_obs_indices), traj["observation"])
 
     traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
     traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
+    traj["future_observation"] = future_observation
 
     # indicates whether an entire observation is padding
     traj["observation"]["pad_mask"] = chunk_indices >= 0

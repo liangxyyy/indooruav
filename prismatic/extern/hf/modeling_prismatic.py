@@ -957,9 +957,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = action_head.predict_action(actions_hidden_states)
             if normalized_actions.ndim == 4:
                 if action_branch_index is not None:
-                    normalized_actions = normalized_actions[:, action_branch_index]
+                    normalized_actions = normalized_actions[:, :, action_branch_index]
                 else:
-                    normalized_actions = normalized_actions[:, 0]
+                    normalized_actions = normalized_actions[:, :, 0]
             normalized_actions = normalized_actions.reshape(-1, NUM_ACTIONS_CHUNK, ACTION_DIM)
             if normalized_actions.shape[0] == 1:
                 normalized_actions = normalized_actions[0]

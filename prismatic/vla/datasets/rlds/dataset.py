@@ -398,6 +398,8 @@ def apply_frame_transforms(
     def apply_obs_transform(fn: Callable[[Dict], Dict], frame: Dict) -> Dict:
         frame["task"] = fn(frame["task"])
         frame["observation"] = dl.vmap(fn)(frame["observation"])
+        if "future_observation" in frame:
+            frame["future_observation"] = dl.vmap(fn)(frame["future_observation"])
         return frame
 
     # Decode + resize images (and depth images)

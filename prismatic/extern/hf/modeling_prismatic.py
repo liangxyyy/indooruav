@@ -488,9 +488,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # Update attention mask
         projected_patch_attention_mask = None
         if attention_mask is not None:
+            attention_mask = attention_mask.to(torch.long)
             projected_patch_attention_mask = torch.full(
                 (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                fill_value=True,
+                fill_value=1,
                 dtype=attention_mask.dtype,
                 device=attention_mask.device,
             )

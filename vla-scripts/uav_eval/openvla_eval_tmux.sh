@@ -7,6 +7,9 @@ LOG_DIR="${ROOT_DIR}/shared_folder/logs"
 MODEL_LOG="${LOG_DIR}/openvla_model_runner.log"
 SIM_LOG="${LOG_DIR}/sim_runner.log"
 CONTROLLER_LOG="${LOG_DIR}/vla_controller.log"
+CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/openvla-7b-oft-finetuned-libero-spatial+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage10b_cond_act_token_smoke--1_chkpt}"
+CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.2}"
+USE_CONDITION_PLAN="${USE_CONDITION_PLAN:-true}"
 
 mkdir -p "${LOG_DIR}"
 
@@ -17,7 +20,10 @@ if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
 fi
 
 tmux new-session -d -s "${SESSION_NAME}" -n model
-tmux send-keys -t "${SESSION_NAME}:model" "cd ${ROOT_DIR} && conda run --no-capture-output -n openvla-oft env CUDA_VISIBLE_DEVICES=2 ROBOT_PLATFORM=UAV python -u online_eval/vla_eval/openvla_model_runner.py --pretrained_checkpoint /VLM/liangxinyue_25/openvla-oft/runs/uav/openvla-7b-oft-finetuned-libero-spatial+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage6_full_train_30k_3img_5act_3branch--30000_chkpt --num_action_branches 3 --action_branch_index 0 --num_images_in_input 3 --no-relative_actions 2>&1 | tee ${MODEL_LOG}" C-m
+tmux set-environment -t "${SESSION_NAME}" CHECKPOINT "${CHECKPOINT}"
+tmux set-environment -t "${SESSION_NAME}" CONDITION_THRESHOLD "${CONDITION_THRESHOLD}"
+tmux set-environment -t "${SESSION_NAME}" USE_CONDITION_PLAN "${USE_CONDITION_PLAN}"
+tmux send-keys -t "${SESSION_NAME}:model" "cd ${ROOT_DIR} && bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" C-m
 
 echo "Waiting for OpenVLA model runner to become ready..."
 for _ in $(seq 1 7200); do

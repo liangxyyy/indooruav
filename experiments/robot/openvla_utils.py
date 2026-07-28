@@ -504,6 +504,7 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
             hidden_dim=llm_dim,
             action_dim=ACTION_DIM,
             num_action_branches=getattr(cfg, "num_action_branches", 1),
+            use_cond_action_tokens=getattr(cfg, "use_cond_action_tokens", False),
         )
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(

@@ -15,7 +15,7 @@ from PIL import Image
 
 
 DEFAULT_OPENVLA_ROOT = "/VLM/liangxinyue_25/openvla-oft"
-DEFAULT_CHECKPOINT = "/VLM/liangxinyue_25/openvla-oft/runs/uav/openvla-7b-oft-finetuned-libero-spatial+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage10b_cond_act_token_smoke--1_chkpt"
+DEFAULT_CHECKPOINT = "/VLM/liangxinyue_25/openvla-oft/runs/uav/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt"
 
 
 def parse_args():
@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--num_action_branches", type=int, default=3)
     parser.add_argument("--action_branch_index", type=int, default=0)
     parser.add_argument("--use_condition_plan", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--condition_threshold", type=float, default=0.2)
+    parser.add_argument("--condition_threshold", type=float, default=0.6)
     parser.add_argument("--num_images_in_input", type=int, default=3)
     parser.add_argument("--relative_actions", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--center_crop", action=argparse.BooleanOptionalAction, default=True)

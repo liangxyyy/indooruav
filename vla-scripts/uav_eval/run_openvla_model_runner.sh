@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-/VLM/liangxinyue_25/IndoorUAV-Agent-main}"
-CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/openvla-7b-oft-finetuned-libero-spatial+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage10b_cond_act_token_smoke--1_chkpt}"
-CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.2}"
+CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt}"
+CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.6}"
 USE_CONDITION_PLAN="${USE_CONDITION_PLAN:-true}"
 
 CONDITION_PLAN_FLAG="--use_condition_plan"

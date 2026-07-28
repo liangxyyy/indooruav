@@ -185,6 +185,78 @@ def gather_cond_action_hidden_states(
     return cond_hidden, act_hidden, format_metrics
 
 
+def _unwrap_vla_model(vla):
+    model = vla.module if hasattr(vla, "module") else vla
+    return model.get_base_model() if hasattr(model, "get_base_model") else model
+
+
+def compute_condition_alignment_loss_and_metrics(
+    vla,
+    cond_hidden_states: torch.Tensor,
+    future_pixel_values: Optional[torch.Tensor],
+    instruction_hidden_states: Optional[torch.Tensor],
+    similarity_threshold: float,
+    diversity_margin: float,
+    use_film: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+    if cond_hidden_states is None or future_pixel_values is None:
+        return None, None, {}
+    if use_film:
+        return None, None, {"condition_alignment_skipped_film": 1.0}
+
+    base_vla = _unwrap_vla_model(vla)
+    vision_backbone = base_vla.vision_backbone
+    old_num_images = vision_backbone.get_num_images_in_input()
+
+    with torch.no_grad():
+        batch_size, horizon, channels, height, width = future_pixel_values.shape
+        future_images = future_pixel_values.reshape(batch_size * horizon, channels, height, width)
+        try:
+            vision_backbone.set_num_images_in_input(1)
+            future_patch_embeddings = base_vla._process_vision_features(future_images, use_film=False)
+        finally:
+            vision_backbone.set_num_images_in_input(old_num_images)
+
+        future_image_embeddings = future_patch_embeddings.float().mean(dim=1).reshape(batch_size, horizon, -1)
+        if instruction_hidden_states is not None:
+            future_image_embeddings = future_image_embeddings + instruction_hidden_states.float().detach().unsqueeze(1)
+        future_image_embeddings = torch.nn.functional.normalize(future_image_embeddings, dim=-1).detach()
+
+    cond_embeddings = torch.nn.functional.normalize(cond_hidden_states.float(), dim=-1)
+    similarities = torch.einsum("btkd,btd->btk", cond_embeddings, future_image_embeddings)
+    best_similarity, best_branch = similarities.max(dim=2)
+    sorted_similarity = similarities.sort(dim=2, descending=True).values
+    margin = sorted_similarity[:, :, 0] - sorted_similarity[:, :, 1]
+
+    condition_pair_distances = []
+    for left_branch in range(cond_embeddings.shape[2]):
+        for right_branch in range(left_branch + 1, cond_embeddings.shape[2]):
+            branch_cosine = (cond_embeddings[:, :, left_branch] * cond_embeddings[:, :, right_branch]).sum(dim=-1)
+            condition_pair_distances.append(1.0 - branch_cosine)
+    if condition_pair_distances:
+        condition_pair_distances = torch.stack(condition_pair_distances, dim=2)
+        condition_mean_distance = condition_pair_distances.mean()
+        condition_diversity_loss = torch.relu(diversity_margin - condition_pair_distances).mean()
+    else:
+        condition_mean_distance = torch.zeros((), device=cond_hidden_states.device)
+        condition_diversity_loss = torch.zeros((), device=cond_hidden_states.device)
+
+    condition_alignment_loss = (1.0 - best_similarity).mean()
+
+    return condition_alignment_loss, condition_diversity_loss, {
+        "condition_similarity_mean": similarities.mean().item(),
+        "condition_similarity_best": best_similarity.mean().item(),
+        "condition_similarity_margin": margin.mean().item(),
+        "condition_top_branch_mean": best_branch.float().mean().item(),
+        "condition_threshold_pass_rate": (best_similarity >= similarity_threshold).float().mean().item(),
+        "condition_similarity_t1": best_similarity[:, 0].mean().item(),
+        "condition_similarity_future": best_similarity[:, 1:].mean().item() if horizon > 1 else best_similarity.mean().item(),
+        "condition_alignment_loss": condition_alignment_loss.item(),
+        "condition_diversity_loss": condition_diversity_loss.item(),
+        "condition_mean_distance": condition_mean_distance.item(),
+    }
+
+
 def _unnormalize_actions_for_reward(actions: torch.Tensor, action_norm_stats: Optional[dict]) -> torch.Tensor:
     """Convert normalized action/state predictions back to real units for offline reward metrics."""
     actions = actions.float()
@@ -371,6 +443,10 @@ class FinetuneConfig:
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
     use_cond_action_tokens: bool = False             # If True, use explicit T x K COND/ACT placeholder tokens
+    condition_similarity_threshold: float = 0.2      # Threshold used only for condition-alignment diagnostics
+    condition_alignment_weight: float = 0.0          # Weight for best-branch condition/future-image alignment loss
+    condition_diversity_weight: float = 0.0          # Weight for condition branch diversity loss
+    condition_diversity_margin: float = 0.05         # Minimum desired cosine distance between condition branches
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
     branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
     grpo_reward_weight: float = 0.0                  # Weight for GRPO-style branch reward optimization
@@ -599,6 +675,10 @@ def run_forward_pass(
     use_cond_action_tokens=False,
     cond_token_ids=None,
     act_token_ids=None,
+    condition_similarity_threshold=0.2,
+    condition_alignment_weight=0.0,
+    condition_diversity_weight=0.0,
+    condition_diversity_margin=0.05,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     debug_batch_shapes=False,
@@ -641,6 +721,8 @@ def run_forward_pass(
     proprio = batch["proprio"].to(device_id).to(torch.bfloat16) if use_proprio else None
     labels = batch["labels"].to(device_id)
     debug_info = {}
+    condition_alignment_loss = None
+    condition_diversity_loss = None
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network. 如果使用diffusion，先给动作加噪声
     if use_diffusion:
@@ -744,6 +826,24 @@ def run_forward_pass(
                 num_action_branches=num_action_branches,
             )
             metrics.update(format_metrics)
+            placeholder_token_ids = torch.cat([cond_token_ids, act_token_ids])
+            prompt_mask = ~torch.isin(shifted_input_ids, placeholder_token_ids)
+            prompt_lengths = prompt_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            instruction_hidden_states = (
+                text_hidden_states.float() * prompt_mask.unsqueeze(-1)
+            ).sum(dim=1) / prompt_lengths
+            condition_alignment_loss, condition_diversity_loss, condition_metrics = (
+                compute_condition_alignment_loss_and_metrics(
+                    vla=vla,
+                    cond_hidden_states=cond_hidden_states,
+                    future_pixel_values=future_pixel_values,
+                    instruction_hidden_states=instruction_hidden_states,
+                    similarity_threshold=condition_similarity_threshold,
+                    diversity_margin=condition_diversity_margin,
+                    use_film=use_film,
+                )
+            )
+            metrics.update(condition_metrics)
             actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
         else:
             cond_hidden_states = None
@@ -777,6 +877,10 @@ def run_forward_pass(
             else:
                 ground_truth_actions_for_loss = ground_truth_actions
             loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
+            if condition_alignment_loss is not None and condition_alignment_weight > 0:
+                loss = loss + condition_alignment_weight * condition_alignment_loss
+            if condition_diversity_loss is not None and condition_diversity_weight > 0:
+                loss = loss + condition_diversity_weight * condition_diversity_loss
             if predicted_actions.ndim == 4 and branch_diversity_weight > 0:
                 branch_pair_distances = []
                 for left_branch in range(predicted_actions.shape[2]):
@@ -1181,6 +1285,10 @@ def run_validation(
                 use_cond_action_tokens=cfg.use_cond_action_tokens,
                 cond_token_ids=cond_token_ids,
                 act_token_ids=act_token_ids,
+                condition_similarity_threshold=cfg.condition_similarity_threshold,
+                condition_alignment_weight=cfg.condition_alignment_weight,
+                condition_diversity_weight=cfg.condition_diversity_weight,
+                condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1243,6 +1351,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("branch_diversity_margin must be >= 0")
     if cfg.grpo_reward_weight < 0:
         raise ValueError("grpo_reward_weight must be >= 0")
+    if cfg.condition_alignment_weight < 0:
+        raise ValueError("condition_alignment_weight must be >= 0")
+    if cfg.condition_diversity_weight < 0:
+        raise ValueError("condition_diversity_weight must be >= 0")
+    if cfg.condition_diversity_margin < 0:
+        raise ValueError("condition_diversity_margin must be >= 0")
     if cfg.grpo_reward_weight > 0 and cfg.num_action_branches < 2:
         raise ValueError("grpo_reward_weight > 0 requires num_action_branches >= 2")
     if cfg.grpo_policy_sigma <= 0:
@@ -1558,6 +1672,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         "offline_branch0_reward": deque(maxlen=cfg.grad_accumulation_steps),
         "offline_branch1_reward": deque(maxlen=cfg.grad_accumulation_steps),
         "offline_branch2_reward": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_similarity_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_similarity_best": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_similarity_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_threshold_pass_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_alignment_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training 真正开始训练（核心）
@@ -1591,6 +1712,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_cond_action_tokens=cfg.use_cond_action_tokens,
                 cond_token_ids=cond_token_ids,
                 act_token_ids=act_token_ids,
+                condition_similarity_threshold=cfg.condition_similarity_threshold,
+                condition_alignment_weight=cfg.condition_alignment_weight,
+                condition_diversity_weight=cfg.condition_diversity_weight,
+                condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 debug_batch_shapes=cfg.debug_batch_shapes and batch_idx < cfg.debug_num_batches,

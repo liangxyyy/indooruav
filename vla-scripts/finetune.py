@@ -194,6 +194,71 @@ def _unwrap_vla_model(vla):
     return model.get_base_model() if hasattr(model, "get_base_model") else model
 
 
+def compute_best_of_k_action_loss(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    assignment_temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Assigns one action branch to each (batch, time) target."""
+    if predicted_actions.ndim != 4:
+        raise ValueError("best-of-K action loss requires shape (B, T, K, action_dim)")
+    if assignment_temperature <= 0:
+        raise ValueError("assignment_temperature must be > 0")
+
+    targets = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+    per_time_branch_l1 = torch.abs(predicted_actions.float() - targets.float()).mean(dim=-1)
+    winner_indices = per_time_branch_l1.detach().argmin(dim=2)
+    winner_l1 = per_time_branch_l1.gather(2, winner_indices.unsqueeze(2)).squeeze(2)
+    best_of_k_loss = winner_l1.mean()
+
+    assignment_probabilities = torch.softmax(-per_time_branch_l1 / assignment_temperature, dim=2)
+    branch_usage = assignment_probabilities.mean(dim=(0, 1))
+    uniform_usage = torch.full_like(branch_usage, 1.0 / predicted_actions.shape[2])
+    branch_balance_loss = torch.sum(
+        branch_usage * torch.log((branch_usage + 1e-8) / uniform_usage)
+    )
+    assignment_entropy = -torch.sum(
+        assignment_probabilities * torch.log(assignment_probabilities + 1e-8), dim=2
+    ).mean()
+
+    metrics = {
+        "best_of_k_action_loss": best_of_k_loss.item(),
+        "branch_balance_loss": branch_balance_loss.item(),
+        "branch_assignment_entropy": assignment_entropy.item(),
+    }
+    hard_assignments = torch.nn.functional.one_hot(
+        winner_indices, num_classes=predicted_actions.shape[2]
+    ).float()
+    for branch_idx in range(predicted_actions.shape[2]):
+        metrics[f"branch{branch_idx}_winner_rate"] = hard_assignments[..., branch_idx].mean().item()
+        metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
+
+    return best_of_k_loss, branch_balance_loss, winner_indices, metrics
+
+
+def compute_condition_contrastive_loss(
+    selected_condition_embeddings: torch.Tensor,
+    target_image_embeddings: torch.Tensor,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Matches each selected condition to its own time-indexed future image."""
+    if temperature <= 0:
+        raise ValueError("condition contrastive temperature must be > 0")
+    if selected_condition_embeddings.shape != target_image_embeddings.shape:
+        raise ValueError(
+            "condition and image embedding shapes must match, got "
+            f"{tuple(selected_condition_embeddings.shape)} and {tuple(target_image_embeddings.shape)}"
+        )
+
+    flat_conditions = selected_condition_embeddings.flatten(0, 1)
+    flat_targets = target_image_embeddings.flatten(0, 1)
+    logits = flat_conditions @ flat_targets.transpose(0, 1) / temperature
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    loss = torch.nn.functional.cross_entropy(logits, labels)
+    accuracy = (logits.argmax(dim=1) == labels).float().mean()
+    return loss, accuracy
+
+
 def compute_condition_alignment_loss_and_metrics(
     vla,
     cond_hidden_states: torch.Tensor,
@@ -201,12 +266,15 @@ def compute_condition_alignment_loss_and_metrics(
     instruction_hidden_states: Optional[torch.Tensor],
     similarity_threshold: float,
     diversity_margin: float,
+    selected_branch_indices: Optional[torch.Tensor] = None,
+    contrastive_temperature: float = 0.07,
+    loss_start_time_index: int = 0,
     use_film: bool = False,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
     if cond_hidden_states is None or future_pixel_values is None:
-        return None, None, {}
+        return None, None, None, {}
     if use_film:
-        return None, None, {"condition_alignment_skipped_film": 1.0}
+        return None, None, None, {"condition_alignment_skipped_film": 1.0}
 
     base_vla = _unwrap_vla_model(vla)
     vision_backbone = base_vla.vision_backbone
@@ -228,14 +296,45 @@ def compute_condition_alignment_loss_and_metrics(
 
     cond_embeddings = torch.nn.functional.normalize(cond_hidden_states.float(), dim=-1)
     similarities = torch.einsum("btkd,btd->btk", cond_embeddings, future_image_embeddings)
+    if not 0 <= loss_start_time_index < horizon:
+        raise ValueError(
+            f"condition loss start index must be in [0, {horizon}), got {loss_start_time_index}"
+        )
     best_similarity, best_branch = similarities.max(dim=2)
     sorted_similarity = similarities.sort(dim=2, descending=True).values
     margin = sorted_similarity[:, :, 0] - sorted_similarity[:, :, 1]
+    if selected_branch_indices is None:
+        selected_branch_indices = best_branch
+        coupled_to_action = False
+    else:
+        if selected_branch_indices.shape != best_branch.shape:
+            raise ValueError(
+                f"selected branch shape must be {tuple(best_branch.shape)}, "
+                f"got {tuple(selected_branch_indices.shape)}"
+            )
+        selected_branch_indices = selected_branch_indices.detach()
+        coupled_to_action = True
+
+    selected_similarity = similarities.gather(2, selected_branch_indices.unsqueeze(2)).squeeze(2)
+    selected_condition_embeddings = cond_embeddings.gather(
+        2,
+        selected_branch_indices.unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, cond_embeddings.shape[-1]),
+    ).squeeze(2)
+    supervised_condition_embeddings = selected_condition_embeddings[:, loss_start_time_index:]
+    supervised_future_embeddings = future_image_embeddings[:, loss_start_time_index:]
+    condition_contrastive_loss, condition_contrastive_accuracy = compute_condition_contrastive_loss(
+        supervised_condition_embeddings,
+        supervised_future_embeddings,
+        contrastive_temperature,
+    )
 
     condition_pair_distances = []
     for left_branch in range(cond_embeddings.shape[2]):
         for right_branch in range(left_branch + 1, cond_embeddings.shape[2]):
-            branch_cosine = (cond_embeddings[:, :, left_branch] * cond_embeddings[:, :, right_branch]).sum(dim=-1)
+            branch_cosine = (
+                cond_embeddings[:, loss_start_time_index:, left_branch]
+                * cond_embeddings[:, loss_start_time_index:, right_branch]
+            ).sum(dim=-1)
             condition_pair_distances.append(1.0 - branch_cosine)
     if condition_pair_distances:
         condition_pair_distances = torch.stack(condition_pair_distances, dim=2)
@@ -245,17 +344,28 @@ def compute_condition_alignment_loss_and_metrics(
         condition_mean_distance = torch.zeros((), device=cond_hidden_states.device)
         condition_diversity_loss = torch.zeros((), device=cond_hidden_states.device)
 
-    condition_alignment_loss = (1.0 - best_similarity).mean()
+    condition_alignment_loss = (1.0 - selected_similarity[:, loss_start_time_index:]).mean()
 
-    return condition_alignment_loss, condition_diversity_loss, {
+    return condition_alignment_loss, condition_diversity_loss, condition_contrastive_loss, {
         "condition_similarity_mean": similarities.mean().item(),
         "condition_similarity_best": best_similarity.mean().item(),
+        "condition_similarity_selected": selected_similarity.mean().item(),
         "condition_similarity_margin": margin.mean().item(),
         "condition_top_branch_mean": best_branch.float().mean().item(),
+        "condition_selected_branch_mean": selected_branch_indices.float().mean().item(),
+        "condition_action_branch_match_rate": (
+            (selected_branch_indices == best_branch).float().mean().item() if coupled_to_action else 1.0
+        ),
         "condition_threshold_pass_rate": (best_similarity >= similarity_threshold).float().mean().item(),
+        "condition_future_threshold_pass_rate": (
+            best_similarity[:, loss_start_time_index:] >= similarity_threshold
+        ).float().mean().item(),
         "condition_similarity_t1": best_similarity[:, 0].mean().item(),
         "condition_similarity_future": best_similarity[:, 1:].mean().item() if horizon > 1 else best_similarity.mean().item(),
+        "condition_loss_start_time_index": float(loss_start_time_index),
         "condition_alignment_loss": condition_alignment_loss.item(),
+        "condition_contrastive_loss": condition_contrastive_loss.item(),
+        "condition_contrastive_accuracy": condition_contrastive_accuracy.item(),
         "condition_diversity_loss": condition_diversity_loss.item(),
         "condition_mean_distance": condition_mean_distance.item(),
     }
@@ -455,9 +565,16 @@ class FinetuneConfig:
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
+    use_best_of_k_action_loss: bool = False          # Assign one winning action branch independently at each future time
+    branch_assignment_temperature: float = 0.1       # Soft assignment temperature used by branch balancing
+    branch_balance_weight: float = 0.0               # Weight for uniform branch utilization regularization
     use_cond_action_tokens: bool = False             # If True, use explicit T x K COND/ACT placeholder tokens
+    couple_condition_to_action_branch: bool = False  # Align the condition that belongs to the winning action branch
     condition_similarity_threshold: float = 0.2      # Threshold used only for condition-alignment diagnostics
-    condition_alignment_weight: float = 0.0          # Weight for best-branch condition/future-image alignment loss
+    condition_alignment_weight: float = 0.0          # Weight for selected condition/future-image alignment loss
+    condition_contrastive_weight: float = 0.0        # Weight for time/batch-negative condition contrastive loss
+    condition_contrastive_temperature: float = 0.07  # InfoNCE temperature for condition/image matching
+    condition_loss_start_time_index: int = 0         # First condition time supervised; use 1 when condition at t=0 is unused
     condition_diversity_weight: float = 0.0          # Weight for condition branch diversity loss
     condition_diversity_margin: float = 0.05         # Minimum desired cosine distance between condition branches
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
@@ -675,6 +792,9 @@ def run_forward_pass(
     use_l1_regression,
     use_diffusion,
     num_action_branches,
+    use_best_of_k_action_loss,
+    branch_assignment_temperature,
+    branch_balance_weight,
     branch_diversity_weight,
     branch_diversity_margin,
     grpo_reward_weight,
@@ -688,8 +808,12 @@ def run_forward_pass(
     use_cond_action_tokens=False,
     cond_token_ids=None,
     act_token_ids=None,
+    couple_condition_to_action_branch=False,
     condition_similarity_threshold=0.2,
     condition_alignment_weight=0.0,
+    condition_contrastive_weight=0.0,
+    condition_contrastive_temperature=0.07,
+    condition_loss_start_time_index=0,
     condition_diversity_weight=0.0,
     condition_diversity_margin=0.05,
     compute_diffusion_l1=False,
@@ -735,7 +859,9 @@ def run_forward_pass(
     labels = batch["labels"].to(device_id)
     debug_info = {}
     condition_alignment_loss = None
+    condition_contrastive_loss = None
     condition_diversity_loss = None
+    action_winner_indices = None
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network. 如果使用diffusion，先给动作加噪声
     if use_diffusion:
@@ -845,21 +971,10 @@ def run_forward_pass(
             instruction_hidden_states = (
                 text_hidden_states.float() * prompt_mask.unsqueeze(-1)
             ).sum(dim=1) / prompt_lengths
-            condition_alignment_loss, condition_diversity_loss, condition_metrics = (
-                compute_condition_alignment_loss_and_metrics(
-                    vla=vla,
-                    cond_hidden_states=cond_hidden_states,
-                    future_pixel_values=future_pixel_values,
-                    instruction_hidden_states=instruction_hidden_states,
-                    similarity_threshold=condition_similarity_threshold,
-                    diversity_margin=condition_diversity_margin,
-                    use_film=use_film,
-                )
-            )
-            metrics.update(condition_metrics)
             actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
         else:
             cond_hidden_states = None
+            instruction_hidden_states = None
             actions_hidden_states = (
                 text_hidden_states[current_action_mask | next_actions_mask]
                 .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
@@ -884,14 +999,53 @@ def run_forward_pass(
             if debug_batch_shapes:
                 debug_info["predicted_actions"] = _shape(predicted_actions)
                 debug_info["predicted_actions_device"] = _device(predicted_actions)
-            # Get full L1 loss,和专家动作的L1 loss
-            if num_action_branches > 1:
+            # Assign one expert target to one branch at each future time.
+            if predicted_actions.ndim == 4 and use_best_of_k_action_loss:
+                (
+                    loss,
+                    branch_balance_loss,
+                    action_winner_indices,
+                    assignment_metrics,
+                ) = compute_best_of_k_action_loss(
+                    predicted_actions,
+                    ground_truth_actions,
+                    branch_assignment_temperature,
+                )
+                loss = loss + branch_balance_weight * branch_balance_loss
+                metrics.update(assignment_metrics)
+            elif num_action_branches > 1:
                 ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+                loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
             else:
                 ground_truth_actions_for_loss = ground_truth_actions
-            loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
+                loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
+
+            if cond_hidden_states is not None:
+                selected_condition_branches = (
+                    action_winner_indices if couple_condition_to_action_branch else None
+                )
+                (
+                    condition_alignment_loss,
+                    condition_diversity_loss,
+                    condition_contrastive_loss,
+                    condition_metrics,
+                ) = compute_condition_alignment_loss_and_metrics(
+                    vla=vla,
+                    cond_hidden_states=cond_hidden_states,
+                    future_pixel_values=future_pixel_values,
+                    instruction_hidden_states=instruction_hidden_states,
+                    similarity_threshold=condition_similarity_threshold,
+                    diversity_margin=condition_diversity_margin,
+                    selected_branch_indices=selected_condition_branches,
+                    contrastive_temperature=condition_contrastive_temperature,
+                    loss_start_time_index=condition_loss_start_time_index,
+                    use_film=use_film,
+                )
+                metrics.update(condition_metrics)
             if condition_alignment_loss is not None and condition_alignment_weight > 0:
                 loss = loss + condition_alignment_weight * condition_alignment_loss
+            if condition_contrastive_loss is not None and condition_contrastive_weight > 0:
+                loss = loss + condition_contrastive_weight * condition_contrastive_loss
             if condition_diversity_loss is not None and condition_diversity_weight > 0:
                 loss = loss + condition_diversity_weight * condition_diversity_loss
             if predicted_actions.ndim == 4 and branch_diversity_weight > 0:
@@ -901,9 +1055,9 @@ def run_forward_pass(
                         branch_pair_distances.append(
                             torch.abs(
                                 predicted_actions[:, :, left_branch] - predicted_actions[:, :, right_branch]
-                            ).mean(dim=(1, 2))
+                            ).mean(dim=-1)
                         )
-                branch_pair_distances = torch.stack(branch_pair_distances, dim=1)
+                branch_pair_distances = torch.stack(branch_pair_distances, dim=2)
                 branch_mean_distance = branch_pair_distances.mean()
                 branch_diversity_loss = torch.relu(branch_diversity_margin - branch_pair_distances).mean()
                 loss = loss + branch_diversity_weight * branch_diversity_loss
@@ -963,7 +1117,17 @@ def run_forward_pass(
         # Get detailed L1 losses for logging
         should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
-            predicted_actions_for_metrics = predicted_actions[:, :, 0] if predicted_actions.ndim == 4 else predicted_actions
+            if predicted_actions.ndim == 4 and action_winner_indices is not None:
+                predicted_actions_for_metrics = predicted_actions.gather(
+                    2,
+                    action_winner_indices.unsqueeze(2).unsqueeze(3).expand(
+                        -1, -1, 1, predicted_actions.shape[-1]
+                    ),
+                ).squeeze(2)
+            elif predicted_actions.ndim == 4:
+                predicted_actions_for_metrics = predicted_actions[:, :, 0]
+            else:
+                predicted_actions_for_metrics = predicted_actions
             #分开的原因是：第一步动作最直接影响当前控制，未来动作更多是为了规划，当前动作更重要，所以单独算
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions_for_metrics[:, 0]
@@ -978,8 +1142,10 @@ def run_forward_pass(
             if predicted_actions.ndim == 4:
                 branch_targets = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
                 per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(1, 3))
+                per_time_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=3)
                 l1_metrics["all_branches_l1_loss"] = per_branch_l1.mean().item()
                 l1_metrics["best_branch_l1_loss"] = per_branch_l1.min(dim=1).values.mean().item()
+                l1_metrics["best_of_k_time_l1_loss"] = per_time_branch_l1.min(dim=2).values.mean().item()
                 l1_metrics.update(
                     compute_offline_branch_rewards(predicted_actions, ground_truth_actions, action_norm_stats)
                 )
@@ -1285,6 +1451,9 @@ def run_validation(
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 num_action_branches=cfg.num_action_branches,
+                use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
+                branch_assignment_temperature=cfg.branch_assignment_temperature,
+                branch_balance_weight=cfg.branch_balance_weight,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
                 grpo_reward_weight=cfg.grpo_reward_weight,
@@ -1298,8 +1467,12 @@ def run_validation(
                 use_cond_action_tokens=cfg.use_cond_action_tokens,
                 cond_token_ids=cond_token_ids,
                 act_token_ids=act_token_ids,
+                couple_condition_to_action_branch=cfg.couple_condition_to_action_branch,
                 condition_similarity_threshold=cfg.condition_similarity_threshold,
                 condition_alignment_weight=cfg.condition_alignment_weight,
+                condition_contrastive_weight=cfg.condition_contrastive_weight,
+                condition_contrastive_temperature=cfg.condition_contrastive_temperature,
+                condition_loss_start_time_index=cfg.condition_loss_start_time_index,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=True,
@@ -1354,6 +1527,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
         raise ValueError("num_action_branches > 1 is currently supported only with use_l1_regression=True")
+    if cfg.use_best_of_k_action_loss and cfg.num_action_branches < 2:
+        raise ValueError("use_best_of_k_action_loss requires num_action_branches >= 2")
+    if cfg.branch_assignment_temperature <= 0:
+        raise ValueError("branch_assignment_temperature must be > 0")
+    if cfg.branch_balance_weight < 0:
+        raise ValueError("branch_balance_weight must be >= 0")
     if cfg.use_cond_action_tokens and not cfg.use_l1_regression:
         raise ValueError("use_cond_action_tokens currently requires use_l1_regression=True")
     if cfg.use_cond_action_tokens and cfg.use_diffusion:
@@ -1366,12 +1545,32 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("grpo_reward_weight must be >= 0")
     if cfg.condition_alignment_weight < 0:
         raise ValueError("condition_alignment_weight must be >= 0")
+    if cfg.condition_contrastive_weight < 0:
+        raise ValueError("condition_contrastive_weight must be >= 0")
+    if cfg.condition_contrastive_temperature <= 0:
+        raise ValueError("condition_contrastive_temperature must be > 0")
+    if not 0 <= cfg.condition_loss_start_time_index < NUM_ACTIONS_CHUNK:
+        raise ValueError(
+            f"condition_loss_start_time_index must be in [0, {NUM_ACTIONS_CHUNK})"
+        )
+    if cfg.couple_condition_to_action_branch and (
+        not cfg.use_cond_action_tokens or not cfg.use_best_of_k_action_loss
+    ):
+        raise ValueError(
+            "couple_condition_to_action_branch requires use_cond_action_tokens "
+            "and use_best_of_k_action_loss"
+        )
     if cfg.condition_diversity_weight < 0:
         raise ValueError("condition_diversity_weight must be >= 0")
     if cfg.condition_diversity_margin < 0:
         raise ValueError("condition_diversity_margin must be >= 0")
     if cfg.grpo_reward_weight > 0 and cfg.num_action_branches < 2:
         raise ValueError("grpo_reward_weight > 0 requires num_action_branches >= 2")
+    if cfg.grpo_reward_weight > 0 and cfg.use_best_of_k_action_loss:
+        raise ValueError(
+            "The current GRPO loss treats K as whole-trajectory branches and is incompatible "
+            "with per-time best-of-K; set grpo_reward_weight=0 for Stage14"
+        )
     if cfg.grpo_policy_sigma <= 0:
         raise ValueError("grpo_policy_sigma must be > 0")
     if cfg.grpo_advantage_eps <= 0:
@@ -1671,6 +1870,16 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "all_branches_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "best_of_k_time_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "best_of_k_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch_balance_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch_assignment_entropy": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch0_winner_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch1_winner_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch2_winner_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch0_soft_usage": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch1_soft_usage": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch2_soft_usage": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
         "format_cond_token_count": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1695,12 +1904,33 @@ def finetune(cfg: FinetuneConfig) -> None:
         "offline_branch2_reward": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_similarity_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_similarity_best": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_similarity_selected": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_similarity_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_selected_branch_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_action_branch_match_rate": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_threshold_pass_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_future_threshold_pass_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_loss_start_time_index": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_alignment_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_contrastive_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_contrastive_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    for branch_idx in range(cfg.num_action_branches):
+        recent_metrics.setdefault(
+            f"branch{branch_idx}_winner_rate", deque(maxlen=cfg.grad_accumulation_steps)
+        )
+        recent_metrics.setdefault(
+            f"branch{branch_idx}_soft_usage", deque(maxlen=cfg.grad_accumulation_steps)
+        )
+        recent_metrics.setdefault(
+            f"offline_branch{branch_idx}_reward", deque(maxlen=cfg.grad_accumulation_steps)
+        )
+        recent_metrics.setdefault(
+            f"offline_branch{branch_idx}_final_pos_error",
+            deque(maxlen=cfg.grad_accumulation_steps),
+        )
 
     # Start training 真正开始训练（核心）
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1720,6 +1950,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 num_action_branches=cfg.num_action_branches,
+                use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
+                branch_assignment_temperature=cfg.branch_assignment_temperature,
+                branch_balance_weight=cfg.branch_balance_weight,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
                 grpo_reward_weight=cfg.grpo_reward_weight,
@@ -1733,8 +1966,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_cond_action_tokens=cfg.use_cond_action_tokens,
                 cond_token_ids=cond_token_ids,
                 act_token_ids=act_token_ids,
+                couple_condition_to_action_branch=cfg.couple_condition_to_action_branch,
                 condition_similarity_threshold=cfg.condition_similarity_threshold,
                 condition_alignment_weight=cfg.condition_alignment_weight,
+                condition_contrastive_weight=cfg.condition_contrastive_weight,
+                condition_contrastive_temperature=cfg.condition_contrastive_temperature,
+                condition_loss_start_time_index=cfg.condition_loss_start_time_index,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=compute_diffusion_l1,

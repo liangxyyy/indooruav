@@ -21,5 +21,4 @@ exec conda run --no-capture-output -n openvla-oft \
     --action_branch_index 0 \
     --num_images_in_input 3 \
     --condition_threshold "${CONDITION_THRESHOLD}" \
-    "${CONDITION_PLAN_FLAG}" \
-    --no-relative_actions
+    "${CONDITION_PLAN_FLAG}"

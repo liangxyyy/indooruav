@@ -110,6 +110,10 @@ def _print_dataset_statistics(dataset_statistics: dict) -> None:
         print(f"  dataset: {dataset_name}")
         if "mean" in action_stats:
             print(f"    action_dim: {len(action_stats['mean'])}")
+        if "representation" in action_stats:
+            print(f"    action_representation: {action_stats['representation']}")
+        if "stride" in action_stats:
+            print(f"    future_action_stride: {action_stats['stride']}")
         if "mean" in proprio_stats:
             print(f"    proprio_dim: {len(proprio_stats['mean'])}")
         for key in ("num_trajectories", "num_transitions"):
@@ -301,7 +305,14 @@ def compute_offline_branch_reward_tensors(
         final_yaw_error = yaw_error[:, -1, :]
         traj_pos_error = pos_error.mean(dim=1)
         traj_yaw_error = yaw_error.mean(dim=1)
-        z_below_zero_rate = (pred[..., 2] < 0).float().mean(dim=1)
+        representation = action_norm_stats.get("representation") if action_norm_stats else None
+        if hasattr(representation, "item"):
+            representation = representation.item()
+        if representation == "relative_plan_origin":
+            # A negative z offset means descending, not crossing the world z=0 plane.
+            z_below_zero_rate = torch.zeros_like(final_pos_error)
+        else:
+            z_below_zero_rate = (pred[..., 2] < 0).float().mean(dim=1)
         success = (final_pos_error < 0.5) & (final_yaw_error < torch.pi / 4)
 
         rewards = (
@@ -436,6 +447,8 @@ class FinetuneConfig:
     dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    relative_action_targets: bool = False            # Predict cumulative pose offsets from the current UAV state
+    future_action_stride: int = 1                    # Raw RLDS step spacing between the T future targets
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -1568,6 +1581,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     if cfg.use_image_history and cfg.num_images_in_input < 1:
         raise ValueError("num_images_in_input must be >= 1 when use_image_history=True")
+    if cfg.future_action_stride < 1:
+        raise ValueError("future_action_stride must be >= 1")
+    if cfg.relative_action_targets and (not cfg.use_proprio or ACTION_DIM != 4 or PROPRIO_DIM != 4):
+        raise ValueError("relative_action_targets requires 4D UAV action/proprio and use_proprio=True")
 
     # Multi-image IndoorUAV uses primary-camera history, not wrist cameras.
     use_wrist_image = cfg.num_images_in_input > 1 and not cfg.use_image_history
@@ -1595,6 +1612,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         window_size=window_size,
+        relative_action_targets=cfg.relative_action_targets,
+        future_action_stride=cfg.future_action_stride,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1606,6 +1625,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             image_aug=cfg.image_aug,
             train=False,
             window_size=window_size,
+            relative_action_targets=cfg.relative_action_targets,
+            future_action_stride=cfg.future_action_stride,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

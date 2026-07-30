@@ -29,7 +29,12 @@ def parse_args():
     parser.add_argument("--use_condition_plan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--condition_threshold", type=float, default=0.6)
     parser.add_argument("--num_images_in_input", type=int, default=3)
-    parser.add_argument("--relative_actions", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--relative_actions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override checkpoint action representation detection.",
+    )
     parser.add_argument("--center_crop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--poll_interval", type=float, default=0.1)
     return parser.parse_args()
@@ -54,7 +59,7 @@ def build_cfg(args):
         center_crop=args.center_crop,
         lora_rank=32,
         unnorm_key=args.unnorm_key,
-        use_relative_actions=args.relative_actions,
+        use_relative_actions=bool(args.relative_actions),
         load_in_8bit=False,
         load_in_4bit=False,
         seed=7,
@@ -72,10 +77,13 @@ def normalize_coords(coords):
     return np.asarray(coords[:4], dtype=np.float32)
 
 
-def apply_action(coords, action, relative_actions):
+def apply_action(coords, action, relative_actions, plan_origin=None):
     action = np.asarray(action, dtype=np.float32)[:4]
     if relative_actions:
-        next_coords = np.asarray(coords, dtype=np.float32)[:4] + action
+        if plan_origin is None:
+            raise ValueError("plan_origin is required for relative plan actions")
+        next_coords = np.asarray(plan_origin, dtype=np.float32)[:4] + action
+        next_coords[3] = np.mod(next_coords[3], 2.0 * np.pi)
     else:
         next_coords = action
     return next_coords.astype(float).tolist()
@@ -163,13 +171,26 @@ class OpenVLAModelService:
         print("Loading OpenVLA base model...", flush=True)
         self.vla = get_vla(self.cfg)
         patch_multimodal_attention_mask_dtype(self.vla)
+        action_stats = self.vla.norm_stats[self.cfg.unnorm_key]["action"]
+        checkpoint_relative_actions = action_stats.get("representation") == "relative_plan_origin"
+        self.relative_actions = (
+            checkpoint_relative_actions if args.relative_actions is None else bool(args.relative_actions)
+        )
+        if args.relative_actions is not None and self.relative_actions != checkpoint_relative_actions:
+            print(
+                "WARNING: CLI action representation override disagrees with checkpoint metadata: "
+                f"checkpoint_relative={checkpoint_relative_actions}, cli_relative={self.relative_actions}",
+                flush=True,
+            )
+        self.cfg.use_relative_actions = self.relative_actions
         print(f"Using checkpoint: {args.pretrained_checkpoint}", flush=True)
         print(
             "Condition plan config: "
             f"enabled={args.use_condition_plan}, "
             f"threshold={args.condition_threshold}, "
             f"branches={args.num_action_branches}, "
-            f"images={args.num_images_in_input}",
+            f"images={args.num_images_in_input}, "
+            f"relative_actions={self.relative_actions}",
             flush=True,
         )
         print("Loading OpenVLA processor...", flush=True)
@@ -314,6 +335,7 @@ class OpenVLAModelService:
             "actions": np.asarray(actions, dtype=np.float32),
             "conditions": cond_hidden.squeeze(0).float().cpu().numpy(),
             "instruction_hidden": instruction_hidden.float().cpu().numpy(),
+            "origin": np.asarray(coordinates, dtype=np.float32).copy(),
             "step_index": 0,
         }
         self.plans[episode_key] = plan
@@ -361,7 +383,7 @@ class OpenVLAModelService:
         require_shape("planned_actions", action_chunk, (self.num_actions_chunk, self.args.num_action_branches, 4))
         selected_action = action_chunk[step_index, selected_branch]
         plan["step_index"] = step_index + 1
-        return action_chunk, selected_action, step_index, selected_branch, similarity, replan_reason
+        return action_chunk, selected_action, plan["origin"], step_index, selected_branch, similarity, replan_reason
 
     def get_image_history(self, episode_key, image_array):
         history = self.histories.setdefault(episode_key, deque(maxlen=self.args.num_images_in_input))
@@ -404,9 +426,15 @@ class OpenVLAModelService:
             }
 
             if self.args.use_condition_plan:
-                action_chunk, selected_action, plan_step, selected_branch, condition_similarity, replan_reason = (
-                    self.select_from_condition_plan(episode_key, image_array, image_history, coordinates)
-                )
+                (
+                    action_chunk,
+                    selected_action,
+                    plan_origin,
+                    plan_step,
+                    selected_branch,
+                    condition_similarity,
+                    replan_reason,
+                ) = self.select_from_condition_plan(episode_key, image_array, image_history, coordinates)
             else:
                 action_chunk = self.get_vla_action(
                     self.cfg,
@@ -422,11 +450,12 @@ class OpenVLAModelService:
                 )
                 action_chunk = np.asarray(action_chunk, dtype=np.float32)
                 selected_action = action_chunk[0]
+                plan_origin = coordinates
                 plan_step = 0
                 selected_branch = self.args.action_branch_index
                 condition_similarity = None
                 replan_reason = None
-            new_coords = apply_action(coordinates, selected_action, self.args.relative_actions)
+            new_coords = apply_action(coordinates, selected_action, self.relative_actions, plan_origin)
 
             timestamp = time.time()
             output_file = os.path.join(self.model_output_dir, f"model_output_{timestamp}.json")
@@ -442,7 +471,8 @@ class OpenVLAModelService:
                         "replan_reason": replan_reason,
                         "action_chunk_shape": list(action_chunk.shape),
                         "selected_action": selected_action.astype(float).tolist(),
-                        "relative_actions": self.args.relative_actions,
+                        "relative_actions": self.relative_actions,
+                        "plan_origin": np.asarray(plan_origin, dtype=float).tolist(),
                     },
                     f,
                 )
@@ -456,7 +486,7 @@ class OpenVLAModelService:
                 f"action_shape={list(action_chunk.shape)}, "
                 f"coords={coordinates.astype(float).tolist()}, "
                 f"selected_action={selected_action.astype(float).tolist()}, "
-                f"relative_actions={self.args.relative_actions}, "
+                f"relative_actions={self.relative_actions}, "
                 f"next_coords={new_coords}"
             )
             return True

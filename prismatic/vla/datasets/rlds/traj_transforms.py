@@ -11,7 +11,52 @@ from typing import Dict
 import tensorflow as tf
 
 
-def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
+def _wrap_to_pi(angle: tf.Tensor) -> tf.Tensor:
+    pi = tf.constant(3.141592653589793, angle.dtype)
+    return tf.math.floormod(angle + pi, 2.0 * pi) - pi
+
+
+def _relative_pose(absolute_pose: tf.Tensor, origin_pose: tf.Tensor) -> tf.Tensor:
+    """Expresses absolute (x, y, z, yaw) poses relative to one origin pose."""
+    position = absolute_pose[..., :3] - origin_pose[..., :3]
+    yaw = _wrap_to_pi(absolute_pose[..., 3:4] - origin_pose[..., 3:4])
+    return tf.concat([position, yaw], axis=-1)
+
+
+def relative_action_statistics_trajectory(traj: Dict, horizon: int, stride: int) -> Dict:
+    """Builds flattened plan-relative targets used only to compute action statistics."""
+    if horizon < 1 or stride < 1:
+        raise ValueError("horizon and stride must both be >= 1")
+
+    traj_len = tf.shape(traj["action"])[0]
+    effective_traj_len = tf.maximum(traj_len - (horizon * stride - 1), 0)
+    target_offsets = tf.range(stride - 1, horizon * stride, stride)
+    target_indices = tf.range(effective_traj_len)[:, None] + target_offsets[None]
+    target_actions = tf.gather(traj["action"], target_indices)
+    origins = traj["observation"]["proprio"][:effective_traj_len]
+    relative_actions = _relative_pose(target_actions, origins[:, None])
+
+    return {
+        "action": tf.reshape(relative_actions, [-1, tf.shape(relative_actions)[-1]]),
+        "observation": {"proprio": tf.repeat(origins, repeats=horizon, axis=0)},
+    }
+
+
+def convert_action_chunks_to_relative(traj: Dict, window_size: int) -> Dict:
+    """Converts each absolute action chunk to cumulative offsets from the current state."""
+    origins = traj["observation"]["proprio"][:, window_size - 1]
+    traj["action"] = _relative_pose(traj["action"], origins[:, None])
+    traj["absolute_action_mask"] = tf.zeros_like(traj["absolute_action_mask"], dtype=tf.bool)
+    return traj
+
+
+def chunk_act_obs(
+    traj: Dict,
+    window_size: int,
+    future_action_window_size: int = 0,
+    future_action_stride: int = 1,
+    relative_action_targets: bool = False,
+) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
@@ -22,15 +67,46 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     indicates whether an observation should be considered padding (i.e. if it had come from a timestep
     before the start of the trajectory).
     """
+    if future_action_stride < 1:
+        raise ValueError("future_action_stride must be >= 1")
+
     traj_len = tf.shape(traj["action"])[0]
-    action_dim = traj["action"].shape[-1]
-    effective_traj_len = traj_len - future_action_window_size
+    num_action_targets = future_action_window_size + 1
+    if relative_action_targets:
+        final_action_offset = num_action_targets * future_action_stride - 1
+        target_action_offsets = tf.range(
+            future_action_stride - 1,
+            num_action_targets * future_action_stride,
+            future_action_stride,
+        )
+        future_obs_offsets = tf.range(
+            0,
+            num_action_targets * future_action_stride,
+            future_action_stride,
+        )
+    else:
+        final_action_offset = future_action_window_size * future_action_stride
+        target_action_offsets = tf.range(
+            0,
+            num_action_targets * future_action_stride,
+            future_action_stride,
+        )
+        future_obs_offsets = target_action_offsets + 1
+
+    effective_traj_len = tf.maximum(traj_len - final_action_offset, 0)
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
     )
 
+    action_offsets = tf.concat(
+        [
+            tf.range(-window_size + 1, 0),
+            target_action_offsets,
+        ],
+        axis=0,
+    )
     action_chunk_indices = tf.broadcast_to(
-        tf.range(-window_size + 1, 1 + future_action_window_size),
+        action_offsets,
         [effective_traj_len, window_size + future_action_window_size],
     ) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None],
@@ -43,7 +119,7 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
 
     floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
     future_obs_indices = tf.broadcast_to(
-        tf.range(1, 2 + future_action_window_size),
+        future_obs_offsets,
         [effective_traj_len, future_action_window_size + 1],
     ) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None],

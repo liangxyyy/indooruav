@@ -51,6 +51,9 @@ def make_dataset_from_rlds(
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
+    relative_action_targets: bool = False,
+    relative_action_horizon: int = 1,
+    relative_action_stride: int = 1,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -199,6 +202,12 @@ def make_dataset_from_rlds(
 
         return traj
 
+    if relative_action_targets:
+        if not state_obs_keys:
+            raise ValueError("relative_action_targets requires proprio observations")
+        if relative_action_horizon < 1 or relative_action_stride < 1:
+            raise ValueError("relative_action_horizon and relative_action_stride must both be >= 1")
+
     builder = tfds.builder(name, data_dir=data_dir)
 
     # load or compute dataset statistics
@@ -219,7 +228,34 @@ def make_dataset_from_rlds(
             ),
             save_dir=builder.data_dir,
         )
+        if relative_action_targets:
+            relative_statistics_dataset = full_dataset.traj_map(
+                partial(
+                    traj_transforms.relative_action_statistics_trajectory,
+                    horizon=relative_action_horizon,
+                    stride=relative_action_stride,
+                ),
+                num_parallel_calls,
+            )
+            relative_statistics = get_dataset_statistics(
+                relative_statistics_dataset,
+                hash_dependencies=(
+                    str(builder.info),
+                    str(state_obs_keys),
+                    inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                    "relative_plan_origin",
+                    str(relative_action_horizon),
+                    str(relative_action_stride),
+                    inspect.getsource(traj_transforms.relative_action_statistics_trajectory),
+                ),
+                save_dir=builder.data_dir,
+            )
+            dataset_statistics["action"] = relative_statistics["action"]
     dataset_statistics = tree_map(np.array, dataset_statistics)
+    if relative_action_targets:
+        dataset_statistics["action"]["representation"] = np.array("relative_plan_origin")
+        dataset_statistics["action"]["horizon"] = np.array(relative_action_horizon)
+        dataset_statistics["action"]["stride"] = np.array(relative_action_stride)
 
     # skip normalization for certain action dimensions
     if action_normalization_mask is not None:
@@ -236,14 +272,17 @@ def make_dataset_from_rlds(
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
-    dataset = dataset.traj_map(
-        partial(
-            normalize_action_and_proprio,
-            metadata=dataset_statistics,
-            normalization_type=action_proprio_normalization_type,
-        ),
-        num_parallel_calls,
-    )
+    # Relative targets are constructed after temporal chunking. Their action and
+    # proprio fields are normalized together at that point.
+    if not relative_action_targets:
+        dataset = dataset.traj_map(
+            partial(
+                normalize_action_and_proprio,
+                metadata=dataset_statistics,
+                normalization_type=action_proprio_normalization_type,
+            ),
+            num_parallel_calls,
+        )
 
     return dataset, dataset_statistics
 
@@ -256,6 +295,8 @@ def apply_trajectory_transforms(
     goal_relabeling_kwargs: dict = {},
     window_size: int = 1,
     future_action_window_size: int = 0,
+    future_action_stride: int = 1,
+    relative_action_targets: bool = False,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -335,9 +376,16 @@ def apply_trajectory_transforms(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
+            future_action_stride=future_action_stride,
+            relative_action_targets=relative_action_targets,
         ),
         num_parallel_calls,
     )
+    if relative_action_targets:
+        dataset = dataset.traj_map(
+            partial(traj_transforms.convert_action_chunks_to_relative, window_size=window_size),
+            num_parallel_calls,
+        )
 
     if train and subsample_length is not None:
         dataset = dataset.traj_map(
@@ -443,6 +491,14 @@ def make_single_dataset(
         train=train,
     )
     dataset = apply_trajectory_transforms(dataset, **traj_transform_kwargs, train=train)
+    if traj_transform_kwargs.get("relative_action_targets", False):
+        dataset = dataset.traj_map(
+            partial(
+                normalize_action_and_proprio,
+                metadata=dataset_statistics,
+                normalization_type=dataset_kwargs["action_proprio_normalization_type"],
+            )
+        )
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
 
     # this seems to reduce memory usage without affecting speed
@@ -555,7 +611,17 @@ def make_interleaved_dataset(
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
-        ).flatten(num_parallel_calls=threads)
+        )
+        if traj_transform_kwargs.get("relative_action_targets", False):
+            dataset = dataset.traj_map(
+                partial(
+                    normalize_action_and_proprio,
+                    metadata=all_dataset_statistics[dataset_kwargs["name"]],
+                    normalization_type=dataset_kwargs["action_proprio_normalization_type"],
+                ),
+                threads,
+            )
+        dataset = dataset.flatten(num_parallel_calls=threads)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 

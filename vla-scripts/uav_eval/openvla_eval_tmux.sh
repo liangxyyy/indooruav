@@ -23,7 +23,9 @@ tmux new-session -d -s "${SESSION_NAME}" -n model
 tmux set-environment -t "${SESSION_NAME}" CHECKPOINT "${CHECKPOINT}"
 tmux set-environment -t "${SESSION_NAME}" CONDITION_THRESHOLD "${CONDITION_THRESHOLD}"
 tmux set-environment -t "${SESSION_NAME}" USE_CONDITION_PLAN "${USE_CONDITION_PLAN}"
-tmux send-keys -t "${SESSION_NAME}:model" "cd ${ROOT_DIR} && bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" C-m
+tmux send-keys -t "${SESSION_NAME}:model" \
+  "cd ${ROOT_DIR} && CHECKPOINT='${CHECKPOINT}' CONDITION_THRESHOLD='${CONDITION_THRESHOLD}' USE_CONDITION_PLAN='${USE_CONDITION_PLAN}' bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" \
+  C-m
 
 echo "Waiting for OpenVLA model runner to become ready..."
 for _ in $(seq 1 7200); do

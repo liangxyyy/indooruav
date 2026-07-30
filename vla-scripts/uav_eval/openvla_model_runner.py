@@ -27,6 +27,12 @@ def parse_args():
     parser.add_argument("--num_action_branches", type=int, default=3)
     parser.add_argument("--action_branch_index", type=int, default=0)
     parser.add_argument("--use_condition_plan", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use_cond_action_tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the interleaved <COND>/<ACT> output format independently of condition-based execution.",
+    )
     parser.add_argument("--condition_threshold", type=float, default=0.6)
     parser.add_argument(
         "--condition_patch_topk",
@@ -57,7 +63,7 @@ def build_cfg(args):
         num_action_branches=args.num_action_branches,
         action_branch_index=args.action_branch_index,
         return_all_action_branches=False,
-        use_cond_action_tokens=args.use_condition_plan,
+        use_cond_action_tokens=args.use_cond_action_tokens,
         use_film=False,
         num_images_in_input=args.num_images_in_input,
         use_image_history=True,
@@ -206,6 +212,7 @@ class OpenVLAModelService:
         print(
             "Condition plan config: "
             f"enabled={args.use_condition_plan}, "
+            f"cond_action_tokens={args.use_cond_action_tokens}, "
             f"threshold={args.condition_threshold}, "
             f"patch_topk={self.condition_patch_topk}, "
             "matching=centered_condition_to_patch, "
@@ -410,6 +417,19 @@ class OpenVLAModelService:
         plan["step_index"] = step_index + 1
         return action_chunk, selected_action, plan["origin"], step_index, selected_branch, similarity, replan_reason
 
+    def select_fixed_branch_replan(self, episode_key, image_history, coordinates):
+        """Replan from every observation and execute time zero from one fixed branch."""
+        plan = self.create_condition_plan(episode_key, image_history, coordinates)
+        action_chunk = plan["actions"]
+        require_shape(
+            "planned_actions",
+            action_chunk,
+            (self.num_actions_chunk, self.args.num_action_branches, 4),
+        )
+        selected_branch = self.args.action_branch_index
+        selected_action = action_chunk[0, selected_branch]
+        return action_chunk, selected_action, plan["origin"], 0, selected_branch, None, "fixed_branch_replan"
+
     def get_image_history(self, episode_key, image_array):
         history = self.histories.setdefault(episode_key, deque(maxlen=self.args.num_images_in_input))
         if not history:
@@ -460,6 +480,16 @@ class OpenVLAModelService:
                     condition_similarity,
                     replan_reason,
                 ) = self.select_from_condition_plan(episode_key, image_array, image_history, coordinates)
+            elif self.args.use_cond_action_tokens:
+                (
+                    action_chunk,
+                    selected_action,
+                    plan_origin,
+                    plan_step,
+                    selected_branch,
+                    condition_similarity,
+                    replan_reason,
+                ) = self.select_fixed_branch_replan(episode_key, image_history, coordinates)
             else:
                 action_chunk = self.get_vla_action(
                     self.cfg,

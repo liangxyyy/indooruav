@@ -103,7 +103,12 @@ def process_episode(trajectory_file, indoor_uav_base):
         # 处理预测轨迹 (跳过第0个点)
         pred_full_seq = trajectory[2:]
         if not pred_full_seq:
-            raise ValueError("predicted trajectory contains no executed action")
+            if not trajectory:
+                raise ValueError("predicted trajectory is empty")
+            # A zero-action episode remains at its last recorded initial pose and
+            # must still count in the evaluation denominator.
+            pred_full_seq = [trajectory[-1]]
+        executed_actions = max(len(trajectory) - 2, 0)
 
         # 检查是否满足停止条件
         stop_index = None
@@ -172,6 +177,7 @@ def process_episode(trajectory_file, indoor_uav_base):
             "final_dist": final_dist,
             "final_angle_diff": final_angle_diff,
             "stopped": stop_index is not None,
+            "executed_actions": executed_actions,
         }
     except Exception as e:
         print(f"Error processing {trajectory_file}: {str(e)}")
@@ -183,9 +189,28 @@ def main():
     parser.add_argument("--trajectories_dir", required=True)
     parser.add_argument("--indoor_uav_base", default=DEFAULT_INDOOR_UAV_BASE)
     parser.add_argument("--output_file", required=True)
+    parser.add_argument(
+        "--episode_keys_file",
+        help="Optional test_vla.json used to evaluate the same ordered episode subset as the controller.",
+    )
+    parser.add_argument("--start_index", type=int, default=0)
+    parser.add_argument("--max_episodes", type=int, default=0)
     args = parser.parse_args()
     trajectories_dir = args.trajectories_dir
     output_file = args.output_file
+    if args.start_index < 0 or args.max_episodes < 0:
+        raise ValueError("start_index and max_episodes must be >= 0")
+
+    selected_episodes = None
+    if args.episode_keys_file:
+        with open(args.episode_keys_file, "r") as f:
+            ordered_episodes = list(json.load(f).keys())
+        ordered_episodes = ordered_episodes[args.start_index:]
+        if args.max_episodes > 0:
+            ordered_episodes = ordered_episodes[:args.max_episodes]
+        selected_episodes = {episode.lstrip("/") for episode in ordered_episodes}
+        if not selected_episodes:
+            raise ValueError("The requested metric subset contains no episodes")
 
     # 收集所有结果
     all_results = []
@@ -202,6 +227,8 @@ def main():
             result = process_episode(filepath, args.indoor_uav_base)
 
             if result:
+                if selected_episodes is not None and result["episode"] not in selected_episodes:
+                    continue
                 all_results.append(result)
                 total_count += 1
                 total_nDTW += result["nDTW"]
@@ -216,6 +243,9 @@ def main():
     avg_nDTW = total_nDTW / total_count if total_count > 0 else 0.0
     avg_position_nDTW = total_position_nDTW / total_count if total_count > 0 else 0.0
     avg_yaw_nDTW = total_yaw_nDTW / total_count if total_count > 0 else 0.0
+    if selected_episodes is not None and total_count != len(selected_episodes):
+        missing_count = len(selected_episodes) - total_count
+        print(f"WARNING: {missing_count} selected episodes were not found in the trajectory directory")
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     # 保存结果
     with open(output_file, 'w') as f:

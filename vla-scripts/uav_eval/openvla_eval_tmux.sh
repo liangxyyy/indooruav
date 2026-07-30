@@ -10,6 +10,7 @@ CONTROLLER_LOG="${LOG_DIR}/vla_controller.log"
 CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt}"
 CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.6}"
 USE_CONDITION_PLAN="${USE_CONDITION_PLAN:-true}"
+USE_COND_ACTION_TOKENS="${USE_COND_ACTION_TOKENS:-true}"
 EVAL_START_INDEX="${EVAL_START_INDEX:-0}"
 MAX_EVAL_EPISODES="${MAX_EVAL_EPISODES:-0}"
 TRAJECTORY_OUTPUT="${TRAJECTORY_OUTPUT:-${ROOT_DIR}/shared_folder/trajectories}"
@@ -26,11 +27,12 @@ tmux new-session -d -s "${SESSION_NAME}" -n model
 tmux set-environment -t "${SESSION_NAME}" CHECKPOINT "${CHECKPOINT}"
 tmux set-environment -t "${SESSION_NAME}" CONDITION_THRESHOLD "${CONDITION_THRESHOLD}"
 tmux set-environment -t "${SESSION_NAME}" USE_CONDITION_PLAN "${USE_CONDITION_PLAN}"
+tmux set-environment -t "${SESSION_NAME}" USE_COND_ACTION_TOKENS "${USE_COND_ACTION_TOKENS}"
 tmux set-environment -t "${SESSION_NAME}" EVAL_START_INDEX "${EVAL_START_INDEX}"
 tmux set-environment -t "${SESSION_NAME}" MAX_EVAL_EPISODES "${MAX_EVAL_EPISODES}"
 tmux set-environment -t "${SESSION_NAME}" TRAJECTORY_OUTPUT "${TRAJECTORY_OUTPUT}"
 tmux send-keys -t "${SESSION_NAME}:model" \
-  "cd ${ROOT_DIR} && CHECKPOINT='${CHECKPOINT}' CONDITION_THRESHOLD='${CONDITION_THRESHOLD}' USE_CONDITION_PLAN='${USE_CONDITION_PLAN}' bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" \
+  "cd ${ROOT_DIR} && CHECKPOINT='${CHECKPOINT}' CONDITION_THRESHOLD='${CONDITION_THRESHOLD}' USE_CONDITION_PLAN='${USE_CONDITION_PLAN}' USE_COND_ACTION_TOKENS='${USE_COND_ACTION_TOKENS}' bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" \
   C-m
 
 echo "Waiting for OpenVLA model runner to become ready..."

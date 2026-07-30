@@ -3,15 +3,18 @@ set -euo pipefail
 
 SESSION_NAME="${SESSION_NAME:-openvla_uav_eval}"
 ROOT_DIR="/VLM/liangxinyue_25/IndoorUAV-Agent-main"
-LOG_DIR="${ROOT_DIR}/shared_folder/logs"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/shared_folder/logs}"
 MODEL_LOG="${LOG_DIR}/openvla_model_runner.log"
 SIM_LOG="${LOG_DIR}/sim_runner.log"
 CONTROLLER_LOG="${LOG_DIR}/vla_controller.log"
 CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt}"
 CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.6}"
 USE_CONDITION_PLAN="${USE_CONDITION_PLAN:-true}"
+EVAL_START_INDEX="${EVAL_START_INDEX:-0}"
+MAX_EVAL_EPISODES="${MAX_EVAL_EPISODES:-0}"
+TRAJECTORY_OUTPUT="${TRAJECTORY_OUTPUT:-${ROOT_DIR}/shared_folder/trajectories}"
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${TRAJECTORY_OUTPUT}"
 
 if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
   echo "tmux session '${SESSION_NAME}' already exists. Attach with:"
@@ -23,6 +26,9 @@ tmux new-session -d -s "${SESSION_NAME}" -n model
 tmux set-environment -t "${SESSION_NAME}" CHECKPOINT "${CHECKPOINT}"
 tmux set-environment -t "${SESSION_NAME}" CONDITION_THRESHOLD "${CONDITION_THRESHOLD}"
 tmux set-environment -t "${SESSION_NAME}" USE_CONDITION_PLAN "${USE_CONDITION_PLAN}"
+tmux set-environment -t "${SESSION_NAME}" EVAL_START_INDEX "${EVAL_START_INDEX}"
+tmux set-environment -t "${SESSION_NAME}" MAX_EVAL_EPISODES "${MAX_EVAL_EPISODES}"
+tmux set-environment -t "${SESSION_NAME}" TRAJECTORY_OUTPUT "${TRAJECTORY_OUTPUT}"
 tmux send-keys -t "${SESSION_NAME}:model" \
   "cd ${ROOT_DIR} && CHECKPOINT='${CHECKPOINT}' CONDITION_THRESHOLD='${CONDITION_THRESHOLD}' USE_CONDITION_PLAN='${USE_CONDITION_PLAN}' bash online_eval/vla_eval/run_openvla_model_runner.sh 2>&1 | tee ${MODEL_LOG}" \
   C-m
@@ -52,7 +58,9 @@ tmux new-window -t "${SESSION_NAME}" -n sim
 tmux send-keys -t "${SESSION_NAME}:sim" "cd ${ROOT_DIR} && conda run --no-capture-output -n habitat python -u online_eval/vla_eval/sim_runner.py 2>&1 | tee ${SIM_LOG}" C-m
 
 tmux new-window -t "${SESSION_NAME}" -n controller
-tmux send-keys -t "${SESSION_NAME}:controller" "cd ${ROOT_DIR} && conda run --no-capture-output -n habitat python -u online_eval/vla_eval/vla_controller.py 2>&1 | tee ${CONTROLLER_LOG}" C-m
+tmux send-keys -t "${SESSION_NAME}:controller" \
+  "cd ${ROOT_DIR} && EVAL_START_INDEX='${EVAL_START_INDEX}' MAX_EVAL_EPISODES='${MAX_EVAL_EPISODES}' TRAJECTORY_OUTPUT='${TRAJECTORY_OUTPUT}' conda run --no-capture-output -n habitat python -u online_eval/vla_eval/vla_controller.py 2>&1 | tee ${CONTROLLER_LOG}" \
+  C-m
 
 echo "Started tmux session '${SESSION_NAME}'."
 echo "Attach:"
@@ -61,3 +69,5 @@ echo "Logs:"
 echo "  ${MODEL_LOG}"
 echo "  ${SIM_LOG}"
 echo "  ${CONTROLLER_LOG}"
+echo "Trajectory output:"
+echo "  ${TRAJECTORY_OUTPUT}"

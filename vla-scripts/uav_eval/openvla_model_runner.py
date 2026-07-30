@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument("--action_branch_index", type=int, default=0)
     parser.add_argument("--use_condition_plan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--condition_threshold", type=float, default=0.6)
+    parser.add_argument(
+        "--condition_patch_topk",
+        type=int,
+        default=None,
+        help="Override checkpoint patch aggregation count; defaults to checkpoint metadata or 8.",
+    )
     parser.add_argument("--num_images_in_input", type=int, default=3)
     parser.add_argument(
         "--relative_actions",
@@ -87,10 +93,6 @@ def apply_action(coords, action, relative_actions, plan_origin=None):
     else:
         next_coords = action
     return next_coords.astype(float).tolist()
-
-
-def normalize_vector(vector):
-    return vector / (np.linalg.norm(vector) + 1e-8)
 
 
 def require_shape(name, value, expected):
@@ -157,6 +159,7 @@ class OpenVLAModelService:
             prepare_images_for_vla,
         )
         from prismatic.vla.constants import IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, get_act_token, get_cond_token
+        from prismatic.vla.condition_matching import condition_to_patch_similarity
 
         self.args = args
         self.cfg = build_cfg(args)
@@ -167,6 +170,7 @@ class OpenVLAModelService:
         self.ignore_index = IGNORE_INDEX
         self.get_cond_token = get_cond_token
         self.get_act_token = get_act_token
+        self.condition_to_patch_similarity = condition_to_patch_similarity
 
         print("Loading OpenVLA base model...", flush=True)
         self.vla = get_vla(self.cfg)
@@ -183,11 +187,28 @@ class OpenVLAModelService:
                 flush=True,
             )
         self.cfg.use_relative_actions = self.relative_actions
+        checkpoint_patch_topk = getattr(self.vla.config, "condition_patch_topk", 8)
+        checkpoint_matching_centered = getattr(self.vla.config, "condition_matching_centered", False)
+        if not checkpoint_matching_centered:
+            print(
+                "WARNING: checkpoint predates centered condition matching; "
+                "online matching will use the current centered rule.",
+                flush=True,
+            )
+        self.condition_patch_topk = (
+            checkpoint_patch_topk
+            if args.condition_patch_topk is None
+            else args.condition_patch_topk
+        )
+        if self.condition_patch_topk < 1:
+            raise ValueError("condition_patch_topk must be >= 1")
         print(f"Using checkpoint: {args.pretrained_checkpoint}", flush=True)
         print(
             "Condition plan config: "
             f"enabled={args.use_condition_plan}, "
             f"threshold={args.condition_threshold}, "
+            f"patch_topk={self.condition_patch_topk}, "
+            "matching=centered_condition_to_patch, "
             f"branches={args.num_action_branches}, "
             f"images={args.num_images_in_input}, "
             f"relative_actions={self.relative_actions}",
@@ -284,11 +305,7 @@ class OpenVLAModelService:
         act_hidden = text_hidden_states[act_mask].reshape(
             1, self.num_actions_chunk, self.args.num_action_branches, -1
         )
-        placeholder_ids = torch.cat([cond_ids, act_ids])
-        prompt_mask = ~torch.isin(shifted_input_ids, placeholder_ids)
-        prompt_lengths = prompt_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        instruction_hidden = (text_hidden_states.float() * prompt_mask.unsqueeze(-1)).sum(dim=1) / prompt_lengths
-        return cond_hidden, act_hidden, instruction_hidden.squeeze(0)
+        return cond_hidden, act_hidden
 
     def normalize_proprio_for_model(self, coordinates):
         proprio_norm_stats = self.vla.norm_stats[self.cfg.unnorm_key]["proprio"]
@@ -322,7 +339,7 @@ class OpenVLAModelService:
             num_patches += 1
         text_hidden_states = output.hidden_states[-1][:, num_patches:-1]
         shifted_input_ids = inputs["input_ids"][:, 1:]
-        cond_hidden, act_hidden, instruction_hidden = self.gather_plan_hidden_states(text_hidden_states, shifted_input_ids)
+        cond_hidden, act_hidden = self.gather_plan_hidden_states(text_hidden_states, shifted_input_ids)
         require_shape("cond_hidden", cond_hidden, (1, self.num_actions_chunk, self.args.num_action_branches, self.vla.llm_dim))
         require_shape("act_hidden", act_hidden, (1, self.num_actions_chunk, self.args.num_action_branches, self.vla.llm_dim))
         with torch.inference_mode():
@@ -334,14 +351,13 @@ class OpenVLAModelService:
         plan = {
             "actions": np.asarray(actions, dtype=np.float32),
             "conditions": cond_hidden.squeeze(0).float().cpu().numpy(),
-            "instruction_hidden": instruction_hidden.float().cpu().numpy(),
             "origin": np.asarray(coordinates, dtype=np.float32).copy(),
             "step_index": 0,
         }
         self.plans[episode_key] = plan
         return plan
 
-    def encode_observed_condition(self, image_array, instruction_hidden):
+    def encode_observed_condition(self, image_array):
         prompt = self.build_prompt(include_condition_tokens=False)
         image = self.prepare_images_for_vla([image_array], self.cfg)[0]
         inputs = self.processor(prompt, image).to("cuda:0", dtype=torch.bfloat16)
@@ -352,8 +368,7 @@ class OpenVLAModelService:
                 patch_embeddings = self.vla._process_vision_features(inputs["pixel_values"], use_film=False)
             finally:
                 self.vla.vision_backbone.set_num_images_in_input(old_num_images)
-        image_embedding = patch_embeddings.float().mean(dim=1).squeeze(0).cpu().numpy()
-        return normalize_vector(image_embedding + instruction_hidden)
+        return patch_embeddings.squeeze(0).float().cpu().numpy()
 
     def select_from_condition_plan(self, episode_key, image_array, image_history, coordinates):
         plan = self.plans.get(episode_key)
@@ -367,9 +382,19 @@ class OpenVLAModelService:
             selected_branch = self.args.action_branch_index
             similarity = None
         else:
-            observed_embedding = self.encode_observed_condition(image_array, plan["instruction_hidden"])
-            cond_embeddings = np.stack([normalize_vector(v) for v in plan["conditions"][step_index]], axis=0)
-            similarities = cond_embeddings @ observed_embedding
+            observed_patches = torch.as_tensor(
+                self.encode_observed_condition(image_array),
+                dtype=torch.float32,
+            ).unsqueeze(0).unsqueeze(0)
+            cond_embeddings = torch.as_tensor(
+                plan["conditions"][step_index],
+                dtype=torch.float32,
+            ).unsqueeze(0).unsqueeze(0)
+            similarities = self.condition_to_patch_similarity(
+                cond_embeddings,
+                observed_patches,
+                self.condition_patch_topk,
+            ).squeeze(0).squeeze(0).numpy()
             selected_branch = int(np.argmax(similarities))
             similarity = float(similarities[selected_branch])
             if similarity < self.args.condition_threshold:

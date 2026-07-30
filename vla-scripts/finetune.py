@@ -52,6 +52,12 @@ from prismatic.training.train_utils import (
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.condition_matching import (
+    center_condition_branches,
+    center_visual_patches,
+    condition_branch_contrastive_loss,
+    condition_to_patch_similarity,
+)
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -263,12 +269,12 @@ def compute_condition_alignment_loss_and_metrics(
     vla,
     cond_hidden_states: torch.Tensor,
     future_pixel_values: Optional[torch.Tensor],
-    instruction_hidden_states: Optional[torch.Tensor],
     similarity_threshold: float,
     diversity_margin: float,
     selected_branch_indices: Optional[torch.Tensor] = None,
     contrastive_temperature: float = 0.07,
     loss_start_time_index: int = 0,
+    patch_topk: int = 8,
     use_film: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
     if cond_hidden_states is None or future_pixel_values is None:
@@ -289,13 +295,18 @@ def compute_condition_alignment_loss_and_metrics(
         finally:
             vision_backbone.set_num_images_in_input(old_num_images)
 
-        future_image_embeddings = future_patch_embeddings.float().mean(dim=1).reshape(batch_size, horizon, -1)
-        if instruction_hidden_states is not None:
-            future_image_embeddings = future_image_embeddings + instruction_hidden_states.float().detach().unsqueeze(1)
-        future_image_embeddings = torch.nn.functional.normalize(future_image_embeddings, dim=-1).detach()
+        future_patch_embeddings = future_patch_embeddings.float().reshape(
+            batch_size, horizon, future_patch_embeddings.shape[1], -1
+        ).detach()
 
     cond_embeddings = torch.nn.functional.normalize(cond_hidden_states.float(), dim=-1)
-    similarities = torch.einsum("btkd,btd->btk", cond_embeddings, future_image_embeddings)
+    centered_cond_embeddings = center_condition_branches(cond_hidden_states)
+    centered_future_patch_embeddings = center_visual_patches(future_patch_embeddings)
+    similarities = condition_to_patch_similarity(
+        cond_hidden_states,
+        future_patch_embeddings,
+        patch_topk,
+    )
     if not 0 <= loss_start_time_index < horizon:
         raise ValueError(
             f"condition loss start index must be in [0, {horizon}), got {loss_start_time_index}"
@@ -316,16 +327,15 @@ def compute_condition_alignment_loss_and_metrics(
         coupled_to_action = True
 
     selected_similarity = similarities.gather(2, selected_branch_indices.unsqueeze(2)).squeeze(2)
-    selected_condition_embeddings = cond_embeddings.gather(
-        2,
-        selected_branch_indices.unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, cond_embeddings.shape[-1]),
-    ).squeeze(2)
-    supervised_condition_embeddings = selected_condition_embeddings[:, loss_start_time_index:]
-    supervised_future_embeddings = future_image_embeddings[:, loss_start_time_index:]
-    condition_contrastive_loss, condition_contrastive_accuracy = compute_condition_contrastive_loss(
-        supervised_condition_embeddings,
-        supervised_future_embeddings,
-        contrastive_temperature,
+    (
+        condition_contrastive_loss,
+        condition_contrastive_accuracy,
+        condition_contrastive_margin,
+    ) = condition_branch_contrastive_loss(
+        similarities,
+        selected_branch_indices,
+        temperature=contrastive_temperature,
+        loss_start_time_index=loss_start_time_index,
     )
 
     condition_pair_distances = []
@@ -363,9 +373,15 @@ def compute_condition_alignment_loss_and_metrics(
         "condition_similarity_t1": best_similarity[:, 0].mean().item(),
         "condition_similarity_future": best_similarity[:, 1:].mean().item() if horizon > 1 else best_similarity.mean().item(),
         "condition_loss_start_time_index": float(loss_start_time_index),
+        "condition_patch_topk": float(patch_topk),
+        "condition_matching_centered": 1.0,
+        "condition_contrastive_num_branches": float(similarities.shape[2]),
+        "condition_centered_norm_mean": centered_cond_embeddings.norm(dim=-1).mean().item(),
+        "condition_patch_centered_norm_mean": centered_future_patch_embeddings.norm(dim=-1).mean().item(),
         "condition_alignment_loss": condition_alignment_loss.item(),
         "condition_contrastive_loss": condition_contrastive_loss.item(),
         "condition_contrastive_accuracy": condition_contrastive_accuracy.item(),
+        "condition_contrastive_margin": condition_contrastive_margin.item(),
         "condition_diversity_loss": condition_diversity_loss.item(),
         "condition_mean_distance": condition_mean_distance.item(),
     }
@@ -572,9 +588,10 @@ class FinetuneConfig:
     couple_condition_to_action_branch: bool = False  # Align the condition that belongs to the winning action branch
     condition_similarity_threshold: float = 0.2      # Threshold used only for condition-alignment diagnostics
     condition_alignment_weight: float = 0.0          # Weight for selected condition/future-image alignment loss
-    condition_contrastive_weight: float = 0.0        # Weight for time/batch-negative condition contrastive loss
-    condition_contrastive_temperature: float = 0.07  # InfoNCE temperature for condition/image matching
+    condition_contrastive_weight: float = 0.0        # Weight for per-time K-way condition branch selection
+    condition_contrastive_temperature: float = 0.07  # Softmax temperature for condition branch selection
     condition_loss_start_time_index: int = 0         # First condition time supervised; use 1 when condition at t=0 is unused
+    condition_patch_topk: int = 8                    # Strongest visual-token matches averaged per condition
     condition_diversity_weight: float = 0.0          # Weight for condition branch diversity loss
     condition_diversity_margin: float = 0.05         # Minimum desired cosine distance between condition branches
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
@@ -814,6 +831,7 @@ def run_forward_pass(
     condition_contrastive_weight=0.0,
     condition_contrastive_temperature=0.07,
     condition_loss_start_time_index=0,
+    condition_patch_topk=8,
     condition_diversity_weight=0.0,
     condition_diversity_margin=0.05,
     compute_diffusion_l1=False,
@@ -965,16 +983,9 @@ def run_forward_pass(
                 num_action_branches=num_action_branches,
             )
             metrics.update(format_metrics)
-            placeholder_token_ids = torch.cat([cond_token_ids, act_token_ids])
-            prompt_mask = ~torch.isin(shifted_input_ids, placeholder_token_ids)
-            prompt_lengths = prompt_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            instruction_hidden_states = (
-                text_hidden_states.float() * prompt_mask.unsqueeze(-1)
-            ).sum(dim=1) / prompt_lengths
             actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
         else:
             cond_hidden_states = None
-            instruction_hidden_states = None
             actions_hidden_states = (
                 text_hidden_states[current_action_mask | next_actions_mask]
                 .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
@@ -1033,12 +1044,12 @@ def run_forward_pass(
                     vla=vla,
                     cond_hidden_states=cond_hidden_states,
                     future_pixel_values=future_pixel_values,
-                    instruction_hidden_states=instruction_hidden_states,
                     similarity_threshold=condition_similarity_threshold,
                     diversity_margin=condition_diversity_margin,
                     selected_branch_indices=selected_condition_branches,
                     contrastive_temperature=condition_contrastive_temperature,
                     loss_start_time_index=condition_loss_start_time_index,
+                    patch_topk=condition_patch_topk,
                     use_film=use_film,
                 )
                 metrics.update(condition_metrics)
@@ -1383,6 +1394,10 @@ def save_training_checkpoint(
             base_vla.resize_token_embeddings(len(processor.tokenizer), pad_to_multiple_of=64)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
+        merged_vla.config.condition_target_fusion = "centered_condition_to_patch_topk"
+        merged_vla.config.condition_patch_topk = cfg.condition_patch_topk
+        merged_vla.config.condition_matching_centered = True
+        merged_vla.config.condition_contrastive_mode = "per_time_branch_selection"
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
@@ -1473,6 +1488,7 @@ def run_validation(
                 condition_contrastive_weight=cfg.condition_contrastive_weight,
                 condition_contrastive_temperature=cfg.condition_contrastive_temperature,
                 condition_loss_start_time_index=cfg.condition_loss_start_time_index,
+                condition_patch_topk=cfg.condition_patch_topk,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=True,
@@ -1553,12 +1569,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError(
             f"condition_loss_start_time_index must be in [0, {NUM_ACTIONS_CHUNK})"
         )
+    if cfg.condition_patch_topk < 1:
+        raise ValueError("condition_patch_topk must be >= 1")
     if cfg.couple_condition_to_action_branch and (
         not cfg.use_cond_action_tokens or not cfg.use_best_of_k_action_loss
     ):
         raise ValueError(
             "couple_condition_to_action_branch requires use_cond_action_tokens "
             "and use_best_of_k_action_loss"
+        )
+    if cfg.condition_contrastive_weight > 0 and not cfg.couple_condition_to_action_branch:
+        raise ValueError(
+            "condition_contrastive_weight > 0 requires couple_condition_to_action_branch=True"
         )
     if cfg.condition_diversity_weight < 0:
         raise ValueError("condition_diversity_weight must be >= 0")
@@ -1911,9 +1933,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         "condition_threshold_pass_rate": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_future_threshold_pass_rate": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_loss_start_time_index": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_patch_topk": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_matching_centered": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_contrastive_num_branches": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_centered_norm_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_patch_centered_norm_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_alignment_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_contrastive_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_contrastive_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_contrastive_margin": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
     }
@@ -1972,6 +2000,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 condition_contrastive_weight=cfg.condition_contrastive_weight,
                 condition_contrastive_temperature=cfg.condition_contrastive_temperature,
                 condition_loss_start_time_index=cfg.condition_loss_start_time_index,
+                condition_patch_topk=cfg.condition_patch_topk,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
                 compute_diffusion_l1=compute_diffusion_l1,

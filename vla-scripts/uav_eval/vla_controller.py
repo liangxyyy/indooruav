@@ -6,13 +6,18 @@ from utils import get_glb_path, is_success, load_posture
 
 # 配置参数
 MAX_INFERENCE_STEPS = 12
+EVAL_START_INDEX = int(os.environ.get("EVAL_START_INDEX", "0"))
+MAX_EVAL_EPISODES = int(os.environ.get("MAX_EVAL_EPISODES", "0"))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SHARED_FOLDER = "shared_folder"
 TEST_VLA_FILE = os.path.join(SCRIPT_DIR, "test_vla.json")
 INDOOR_UAV_BASE = "/VLM/datasets/Indoor_UAV"
 VLA_INS_BASE = os.path.join(INDOOR_UAV_BASE, "vla_ins")
 POSTURE_BASE = os.path.join(INDOOR_UAV_BASE, "without_screenshot")
-TRAJECTORY_OUTPUT = os.path.join(SHARED_FOLDER, "trajectories")
+TRAJECTORY_OUTPUT = os.environ.get(
+    "TRAJECTORY_OUTPUT",
+    os.path.join(SHARED_FOLDER, "trajectories"),
+)
 CONTROLLER_INPUT = os.path.join(SHARED_FOLDER, "controller_input")
 SIM_INPUT_DIR = os.path.join(SHARED_FOLDER, "sim_input")
 SIM_OUTPUT_DIR = os.path.join(SHARED_FOLDER, "sim_output")
@@ -247,6 +252,19 @@ def main():
     # 运行所有episode
     results = {}
     episode_keys = list(test_vla.keys())
+    if EVAL_START_INDEX < 0:
+        raise ValueError("EVAL_START_INDEX must be >= 0")
+    if MAX_EVAL_EPISODES < 0:
+        raise ValueError("MAX_EVAL_EPISODES must be >= 0")
+    episode_keys = episode_keys[EVAL_START_INDEX:]
+    if MAX_EVAL_EPISODES > 0:
+        episode_keys = episode_keys[:MAX_EVAL_EPISODES]
+    if not episode_keys:
+        raise ValueError("The requested evaluation subset contains no episodes")
+    print(
+        f"评估子集: start={EVAL_START_INDEX}, count={len(episode_keys)}, "
+        f"trajectory_output={TRAJECTORY_OUTPUT}"
+    )
 
     for i, episode_key in enumerate(episode_keys):
         print(f"\n{'=' * 40}")

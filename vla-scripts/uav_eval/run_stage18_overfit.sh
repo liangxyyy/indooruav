@@ -5,7 +5,7 @@ REPO_ROOT="/VLM/liangxinyue_25/openvla-oft"
 RUN_ROOT="${REPO_ROOT}/runs/uav"
 DATA_ROOT="/VLM/datasets/indoorUAV_rlds_data/rlds_data_all"
 STAGE12_CHECKPOINT="${RUN_ROOT}/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt"
-RUN_ID="stage18c_k1_overfit4"
+RUN_ID="stage18d_k1_head_only_overfit4"
 
 if [[ ! -f "${STAGE12_CHECKPOINT}/proprio_projector--30000_checkpoint.pt" ]]; then
   echo "Missing Stage12 proprio projector: ${STAGE12_CHECKPOINT}" >&2
@@ -51,14 +51,15 @@ python -u vla-scripts/finetune.py \
   --grpo_reward_weight 0.0 \
   --image_aug False \
   --batch_size 1 \
-  --learning_rate 0.0005 \
+  --learning_rate 0.0001 \
   --lr_warmup_steps 20 \
   --max_grad_norm 10.0 \
   --seed 17 \
-  --max_steps 400 \
+  --max_steps 800 \
   --save_freq 100000 \
   --overfit_fixed_batch_count 4 \
   --overfit_report_freq 25 \
+  --overfit_action_head_only True \
   --wandb_entity 3244403140-jilin-university \
   --wandb_project openvla-uav \
   --run_id_override "$RUN_ID" \

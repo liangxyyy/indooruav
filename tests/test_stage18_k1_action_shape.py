@@ -59,6 +59,15 @@ class Stage18K1ActionShapeTest(unittest.TestCase):
         self.assertIs(selected, incoming)
         self.assertEqual(fixed_batches, [])
 
+    def test_overfit_can_isolate_action_head_parameters(self):
+        module = torch.nn.Linear(3, 2)
+
+        self.finetune.set_module_trainable(module, False)
+        self.assertTrue(all(not parameter.requires_grad for parameter in module.parameters()))
+
+        self.finetune.set_module_trainable(module, True)
+        self.assertTrue(all(parameter.requires_grad for parameter in module.parameters()))
+
 
 if __name__ == "__main__":
     unittest.main()

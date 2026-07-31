@@ -661,6 +661,13 @@ def select_overfit_batch(batch_idx: int, incoming_batch: dict, fixed_batches: li
     return fixed_batches[batch_idx % batch_count]
 
 
+def set_module_trainable(module: Optional[nn.Module], trainable: bool) -> None:
+    if module is None:
+        return
+    for parameter in module.parameters():
+        parameter.requires_grad_(trainable)
+
+
 @dataclass
 class FinetuneConfig:
     # fmt: off
@@ -754,6 +761,7 @@ class FinetuneConfig:
     debug_num_batches: int = 2                       # Number of initial batches to print when debug flags are enabled
     overfit_fixed_batch_count: int = 0               # If > 0, repeatedly train on the first N batches (diagnostic only)
     overfit_report_freq: int = 25                    # Step interval for fixed-batch overfit loss reports
+    overfit_action_head_only: bool = False           # Freeze VLA/proprio during the fixed-batch diagnostic
 
     # fmt: on
 
@@ -1738,6 +1746,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("overfit_fixed_batch_count must be >= 0")
     if cfg.overfit_report_freq < 1:
         raise ValueError("overfit_report_freq must be >= 1")
+    if cfg.overfit_action_head_only and cfg.overfit_fixed_batch_count == 0:
+        raise ValueError("overfit_action_head_only requires overfit_fixed_batch_count > 0")
     if cfg.num_action_branches < 1:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
@@ -1988,6 +1998,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_diffusion:
         NUM_PATCHES += 1
 
+    if cfg.overfit_action_head_only:
+        set_module_trainable(vla, False)
+        set_module_trainable(proprio_projector if cfg.use_proprio else None, False)
+        print("[Overfit diagnostic] Frozen VLA and proprio projector; training action head only")
+
     # Instantiate optimizer 收集所有可训练参数
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
@@ -2214,7 +2229,14 @@ def finetune(cfg: FinetuneConfig) -> None:
             f"{cfg.overfit_fixed_batch_count} batches; this run does not measure generalization."
         )
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-        vla.train()
+        if cfg.overfit_action_head_only:
+            vla.eval()
+            if cfg.use_proprio:
+                proprio_projector.eval()
+        else:
+            vla.train()
+        if cfg.use_l1_regression or cfg.use_diffusion:
+            action_head.train()
         optimizer.zero_grad()
         for batch_idx, incoming_batch in enumerate(dataloader):
             batch = select_overfit_batch(

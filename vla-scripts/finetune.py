@@ -267,6 +267,27 @@ def diagonal_gaussian_nll(
     return 0.5 * squared_error + log_std + 0.5 * math.log(2.0 * math.pi)
 
 
+def match_action_target_shape(predicted_actions: torch.Tensor, ground_truth_actions: torch.Tensor) -> torch.Tensor:
+    """Match [B,T,D] targets to either [B,T,D] or explicit [B,T,K,D] policy outputs."""
+    if predicted_actions.ndim == 3:
+        if predicted_actions.shape != ground_truth_actions.shape:
+            raise ValueError(
+                f"Action shape mismatch: predictions={tuple(predicted_actions.shape)}, "
+                f"targets={tuple(ground_truth_actions.shape)}"
+            )
+        return ground_truth_actions
+    if predicted_actions.ndim == 4:
+        if predicted_actions.shape[:2] != ground_truth_actions.shape[:2] or (
+            predicted_actions.shape[-1] != ground_truth_actions.shape[-1]
+        ):
+            raise ValueError(
+                f"Action shape mismatch: predictions={tuple(predicted_actions.shape)}, "
+                f"targets={tuple(ground_truth_actions.shape)}"
+            )
+        return ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+    raise ValueError(f"Expected action predictions with rank 3 or 4, got rank {predicted_actions.ndim}")
+
+
 def compute_best_of_k_gaussian_action_loss(
     action_mean: torch.Tensor,
     action_log_std: torch.Tensor,
@@ -1126,10 +1147,9 @@ def run_forward_pass(
                 loss = loss + branch_balance_weight * branch_balance_loss
                 metrics.update(assignment_metrics)
             elif use_gaussian_action_head:
-                if predicted_actions.ndim == 4:
-                    ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
-                else:
-                    ground_truth_actions_for_loss = ground_truth_actions
+                ground_truth_actions_for_loss = match_action_target_shape(
+                    predicted_actions, ground_truth_actions
+                )
                 gaussian_nll = diagonal_gaussian_nll(
                     predicted_actions,
                     action_log_std,
@@ -1151,11 +1171,10 @@ def run_forward_pass(
                 )
                 loss = loss + branch_balance_weight * branch_balance_loss
                 metrics.update(assignment_metrics)
-            elif num_action_branches > 1:
-                ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
-                loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
             else:
-                ground_truth_actions_for_loss = ground_truth_actions
+                ground_truth_actions_for_loss = match_action_target_shape(
+                    predicted_actions, ground_truth_actions
+                )
                 loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
 
             if action_log_std is not None:

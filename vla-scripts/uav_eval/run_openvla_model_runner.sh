@@ -6,6 +6,8 @@ CHECKPOINT="${CHECKPOINT:-/VLM/liangxinyue_25/openvla-oft/runs/uav/stage6_30k_ck
 CONDITION_THRESHOLD="${CONDITION_THRESHOLD:-0.6}"
 USE_CONDITION_PLAN="${USE_CONDITION_PLAN:-true}"
 USE_COND_ACTION_TOKENS="${USE_COND_ACTION_TOKENS:-true}"
+NUM_ACTION_BRANCHES="${NUM_ACTION_BRANCHES:-3}"
+ACTION_BRANCH_INDEX="${ACTION_BRANCH_INDEX:-0}"
 
 CONDITION_PLAN_FLAG="--use_condition_plan"
 if [[ "${USE_CONDITION_PLAN}" == "false" || "${USE_CONDITION_PLAN}" == "0" ]]; then
@@ -23,8 +25,8 @@ exec conda run --no-capture-output -n openvla-oft \
   env CUDA_VISIBLE_DEVICES=2 ROBOT_PLATFORM=UAV \
   python -u online_eval/vla_eval/openvla_model_runner.py \
     --pretrained_checkpoint "${CHECKPOINT}" \
-    --num_action_branches 3 \
-    --action_branch_index 0 \
+    --num_action_branches "${NUM_ACTION_BRANCHES}" \
+    --action_branch_index "${ACTION_BRANCH_INDEX}" \
     --num_images_in_input 3 \
     --condition_threshold "${CONDITION_THRESHOLD}" \
     "${CONDITION_PLAN_FLAG}" \

@@ -68,6 +68,25 @@ class Stage18K1ActionShapeTest(unittest.TestCase):
         self.finetune.set_module_trainable(module, True)
         self.assertTrue(all(parameter.requires_grad for parameter in module.parameters()))
 
+    def test_point_regression_loss_supports_controlled_l1_mse_ablation(self):
+        predictions = torch.tensor([[[[2.0, -1.0]]]], requires_grad=True)
+        targets = torch.tensor([[[0.0, 1.0]]])
+
+        l1_loss = self.finetune.compute_action_regression_loss(predictions, targets, "l1")
+        mse_loss = self.finetune.compute_action_regression_loss(predictions, targets, "mse")
+
+        self.assertEqual(l1_loss.item(), 2.0)
+        self.assertEqual(mse_loss.item(), 4.0)
+        mse_loss.backward()
+        self.assertIsNotNone(predictions.grad)
+
+    def test_point_regression_loss_rejects_unknown_objective(self):
+        predictions = torch.zeros(1, 5, 1, 4)
+        targets = torch.zeros(1, 5, 4)
+
+        with self.assertRaisesRegex(ValueError, "Unsupported action_regression_loss"):
+            self.finetune.compute_action_regression_loss(predictions, targets, "huber")
+
 
 if __name__ == "__main__":
     unittest.main()

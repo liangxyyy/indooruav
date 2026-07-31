@@ -5,7 +5,15 @@ REPO_ROOT="/VLM/liangxinyue_25/openvla-oft"
 RUN_ROOT="${REPO_ROOT}/runs/uav"
 DATA_ROOT="/VLM/datasets/indoorUAV_rlds_data/rlds_data_all"
 STAGE12_CHECKPOINT="${RUN_ROOT}/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt"
-RUN_ID="stage18e_k1_head_only_5k"
+LOSS_TYPE="${1:-l1}"
+case "$LOSS_TYPE" in
+  l1) RUN_ID="stage18e_k1_head_only_5k" ;;
+  mse) RUN_ID="stage18f_k1_head_only_mse_5k" ;;
+  *)
+    echo "Usage: bash vla-scripts/uav_eval/run_stage18_head_only.sh {l1|mse}" >&2
+    exit 2
+    ;;
+esac
 MAX_STEPS=5000
 
 if [[ ! -f "${STAGE12_CHECKPOINT}/proprio_projector--30000_checkpoint.pt" ]]; then
@@ -37,6 +45,7 @@ python -u vla-scripts/finetune.py \
   --use_l1_regression True \
   --use_diffusion False \
   --use_gaussian_action_head False \
+  --action_regression_loss "$LOSS_TYPE" \
   --use_proprio True \
   --num_images_in_input 3 \
   --use_image_history True \

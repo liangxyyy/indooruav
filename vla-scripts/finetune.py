@@ -288,6 +288,19 @@ def match_action_target_shape(predicted_actions: torch.Tensor, ground_truth_acti
     raise ValueError(f"Expected action predictions with rank 3 or 4, got rank {predicted_actions.ndim}")
 
 
+def compute_action_regression_loss(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    targets = match_action_target_shape(predicted_actions, ground_truth_actions)
+    if loss_type == "l1":
+        return torch.abs(predicted_actions - targets).mean()
+    if loss_type == "mse":
+        return torch.square(predicted_actions.float() - targets.float()).mean()
+    raise ValueError(f"Unsupported action_regression_loss: {loss_type}")
+
+
 def compute_best_of_k_gaussian_action_loss(
     action_mean: torch.Tensor,
     action_log_std: torch.Tensor,
@@ -687,6 +700,7 @@ class FinetuneConfig:
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     use_gaussian_action_head: bool = False           # If True, optimize a diagonal Gaussian policy with NLL
+    action_regression_loss: str = "l1"               # Point-regression objective: l1 or mse
     gaussian_log_std_min: float = -5.0               # Lower bound for learned Gaussian log standard deviation
     gaussian_log_std_max: float = 1.0                # Upper bound for learned Gaussian log standard deviation
     gaussian_initial_log_std: float = -0.5           # Initial log standard deviation before policy training
@@ -945,6 +959,7 @@ def run_forward_pass(
     use_l1_regression,
     use_diffusion,
     use_gaussian_action_head,
+    action_regression_loss,
     num_action_branches,
     use_best_of_k_action_loss,
     branch_assignment_temperature,
@@ -1193,10 +1208,11 @@ def run_forward_pass(
                 loss = loss + branch_balance_weight * branch_balance_loss
                 metrics.update(assignment_metrics)
             else:
-                ground_truth_actions_for_loss = match_action_target_shape(
-                    predicted_actions, ground_truth_actions
+                loss = compute_action_regression_loss(
+                    predicted_actions,
+                    ground_truth_actions,
+                    action_regression_loss,
                 )
-                loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
 
             if action_log_std is not None:
                 metrics.update(
@@ -1653,6 +1669,7 @@ def run_validation(
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 use_gaussian_action_head=cfg.use_gaussian_action_head,
+                action_regression_loss=cfg.action_regression_loss,
                 num_action_branches=cfg.num_action_branches,
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,
@@ -1729,6 +1746,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     if cfg.use_gaussian_action_head and not cfg.use_l1_regression:
         raise ValueError("use_gaussian_action_head requires use_l1_regression=True")
+    if cfg.action_regression_loss not in {"l1", "mse"}:
+        raise ValueError("action_regression_loss must be one of: l1, mse")
+    if cfg.action_regression_loss != "l1" and (
+        cfg.use_gaussian_action_head or cfg.use_best_of_k_action_loss
+    ):
+        raise ValueError("mse action regression currently supports only a single deterministic branch")
     if cfg.gaussian_log_std_min >= cfg.gaussian_log_std_max:
         raise ValueError("gaussian_log_std_min must be smaller than gaussian_log_std_max")
     if not cfg.gaussian_log_std_min < cfg.gaussian_initial_log_std < cfg.gaussian_log_std_max:
@@ -2261,6 +2284,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 use_gaussian_action_head=cfg.use_gaussian_action_head,
+                action_regression_loss=cfg.action_regression_loss,
                 num_action_branches=cfg.num_action_branches,
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,

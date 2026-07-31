@@ -6,6 +6,7 @@ Fine-tunes OpenVLA via LoRA.
 
 import math
 import os
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
 
 import draccus
+import numpy as np
+import tensorflow as tf
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -89,6 +92,12 @@ def _device(value) -> str:
     if hasattr(value, "device"):
         return str(value.device)
     return "n/a"
+
+
+def _set_torch_seed(seed: int, label: str) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"Set {label} torch seed to {seed}")
 
 
 def _module_grad_norm(module: Optional[nn.Module]) -> Optional[float]:
@@ -676,6 +685,8 @@ class FinetuneConfig:
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
+    max_grad_norm: Optional[float] = None             # Global gradient clipping threshold; disabled when None
+    seed: int = 17                                   # Shared RNG seed for reproducible A/B experiments
     max_steps: int = 200_000                         # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
@@ -1755,6 +1766,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("grpo_advantage_eps must be > 0")
     if cfg.grpo_advantage_clip <= 0:
         raise ValueError("grpo_advantage_clip must be > 0")
+    if cfg.max_grad_norm is not None and cfg.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be > 0 when provided")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -1766,6 +1779,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    _set_torch_seed(cfg.seed, "global")
+    tf.random.set_seed(cfg.seed)
 
     # GPU setup 初始化GPU
     distributed_state = PartialState()
@@ -1831,6 +1849,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # LoRA setup
     if cfg.use_lora:
+        # Keep LoRA initialization identical when comparing base checkpoints that
+        # take different token-resize paths before PEFT wrapping.
+        _set_torch_seed(cfg.seed + 1, "LoRA initialization")
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
@@ -1873,6 +1894,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
+        # The action policy is reset for Stage17 A/B, so isolate its initialization
+        # from any random numbers consumed while loading the selected VLA backbone.
+        _set_torch_seed(cfg.seed + 2, "action-head initialization")
         action_head_class = GaussianActionHead if cfg.use_gaussian_action_head else L1RegressionActionHead
         action_head_args = {
             "input_dim": vla.module.llm_dim,
@@ -2076,6 +2100,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         "gaussian_log_std_min": deque(maxlen=cfg.grad_accumulation_steps),
         "gaussian_log_std_max": deque(maxlen=cfg.grad_accumulation_steps),
         "gaussian_policy_std_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "gradient_norm_before_clip": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_balance_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_assignment_entropy": deque(maxlen=cfg.grad_accumulation_steps),
         "branch0_winner_rate": deque(maxlen=cfg.grad_accumulation_steps),
@@ -2197,6 +2222,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Backward pass
             normalized_loss.backward()
 
+            gradient_step_boundary = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+            if gradient_step_boundary and cfg.max_grad_norm is not None:
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
+                metrics["gradient_norm_before_clip"] = float(total_grad_norm)
+
             if (
                 cfg.debug_batch_shapes
                 and distributed_state.is_main_process
@@ -2256,7 +2286,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
 
             # Optimizer and LR scheduler step 真正更新参数
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if gradient_step_boundary:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

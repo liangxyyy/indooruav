@@ -5,15 +5,16 @@ REPO_ROOT="/VLM/liangxinyue_25/openvla-oft"
 RUN_ROOT="${REPO_ROOT}/runs/uav"
 DATA_ROOT="/VLM/datasets/indoorUAV_rlds_data/rlds_data_all"
 STAGE12_CHECKPOINT="${RUN_ROOT}/stage6_30k_ckpt+indoor_uav+b1+lr-0.0005+lora-r32+dropout-0.0--image_aug--stage12--30000_chkpt"
-RUN_ID="stage18d_k1_head_only_overfit4"
+RUN_ID="stage18e_k1_head_only_5k"
+MAX_STEPS=5000
 
 if [[ ! -f "${STAGE12_CHECKPOINT}/proprio_projector--30000_checkpoint.pt" ]]; then
   echo "Missing Stage12 proprio projector: ${STAGE12_CHECKPOINT}" >&2
   exit 1
 fi
 
-if [[ -e "${RUN_ROOT}/${RUN_ID}" ]]; then
-  echo "Run output already exists: ${RUN_ROOT}/${RUN_ID}" >&2
+if [[ -e "${RUN_ROOT}/${RUN_ID}" || -e "${RUN_ROOT}/${RUN_ID}--${MAX_STEPS}_chkpt" ]]; then
+  echo "Run output already exists for ${RUN_ID}; refusing to overwrite it." >&2
   exit 1
 fi
 
@@ -29,7 +30,7 @@ python -u vla-scripts/finetune.py \
   --data_root_dir "$DATA_ROOT" \
   --dataset_name indoor_uav \
   --run_root_dir "$RUN_ROOT" \
-  --shuffle_buffer_size 32 \
+  --shuffle_buffer_size 1000 \
   --relative_action_targets True \
   --relative_action_wrap_yaw True \
   --future_action_stride 2 \
@@ -49,22 +50,21 @@ python -u vla-scripts/finetune.py \
   --condition_contrastive_weight 0.0 \
   --condition_diversity_weight 0.0 \
   --grpo_reward_weight 0.0 \
-  --image_aug False \
-  --batch_size 1 \
-  --learning_rate 0.0001 \
-  --lr_warmup_steps 20 \
-  --max_grad_norm 10.0 \
-  --seed 17 \
-  --max_steps 800 \
-  --save_freq 100000 \
-  --overfit_fixed_batch_count 4 \
-  --overfit_report_freq 25 \
   --freeze_vla True \
   --freeze_proprio_projector True \
+  --image_aug True \
+  --batch_size 1 \
+  --grad_accumulation_steps 8 \
+  --learning_rate 0.0001 \
+  --lr_warmup_steps 100 \
+  --max_grad_norm 10.0 \
+  --seed 17 \
+  --max_steps "$MAX_STEPS" \
+  --save_freq "$MAX_STEPS" \
   --wandb_entity 3244403140-jilin-university \
   --wandb_project openvla-uav \
   --run_id_override "$RUN_ID" \
   --debug_batch_shapes True \
   --debug_grad_norm True \
-  --debug_num_batches 4 \
+  --debug_num_batches 2 \
   2>&1 | tee "${RUN_ROOT}/${RUN_ID}.log"

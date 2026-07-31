@@ -761,7 +761,8 @@ class FinetuneConfig:
     debug_num_batches: int = 2                       # Number of initial batches to print when debug flags are enabled
     overfit_fixed_batch_count: int = 0               # If > 0, repeatedly train on the first N batches (diagnostic only)
     overfit_report_freq: int = 25                    # Step interval for fixed-batch overfit loss reports
-    overfit_action_head_only: bool = False           # Freeze VLA/proprio during the fixed-batch diagnostic
+    freeze_vla: bool = False                         # Freeze the VLA backbone and any attached LoRA parameters
+    freeze_proprio_projector: bool = False           # Freeze the proprio projector while training other components
 
     # fmt: on
 
@@ -1746,8 +1747,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("overfit_fixed_batch_count must be >= 0")
     if cfg.overfit_report_freq < 1:
         raise ValueError("overfit_report_freq must be >= 1")
-    if cfg.overfit_action_head_only and cfg.overfit_fixed_batch_count == 0:
-        raise ValueError("overfit_action_head_only requires overfit_fixed_batch_count > 0")
+    if cfg.freeze_proprio_projector and not cfg.use_proprio:
+        raise ValueError("freeze_proprio_projector requires use_proprio=True")
     if cfg.num_action_branches < 1:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
@@ -1998,10 +1999,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_diffusion:
         NUM_PATCHES += 1
 
-    if cfg.overfit_action_head_only:
+    if cfg.freeze_vla:
         set_module_trainable(vla, False)
+        print("[Training] Frozen VLA backbone and LoRA parameters")
+    if cfg.freeze_proprio_projector:
         set_module_trainable(proprio_projector if cfg.use_proprio else None, False)
-        print("[Overfit diagnostic] Frozen VLA and proprio projector; training action head only")
+        print("[Training] Frozen proprio projector")
 
     # Instantiate optimizer 收集所有可训练参数
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -2229,12 +2232,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             f"{cfg.overfit_fixed_batch_count} batches; this run does not measure generalization."
         )
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-        if cfg.overfit_action_head_only:
+        if cfg.freeze_vla:
             vla.eval()
-            if cfg.use_proprio:
-                proprio_projector.eval()
         else:
             vla.train()
+        if cfg.use_proprio and cfg.freeze_proprio_projector:
+            proprio_projector.eval()
         if cfg.use_l1_regression or cfg.use_diffusion:
             action_head.train()
         optimizer.zero_grad()

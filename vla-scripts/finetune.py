@@ -120,6 +120,8 @@ def _print_dataset_statistics(dataset_statistics: dict) -> None:
             print(f"    action_representation: {action_stats['representation']}")
         if "stride" in action_stats:
             print(f"    future_action_stride: {action_stats['stride']}")
+        if "yaw_delta_wrapped" in action_stats:
+            print(f"    relative_action_wrap_yaw: {action_stats['yaw_delta_wrapped']}")
         if "mean" in proprio_stats:
             print(f"    proprio_dim: {len(proprio_stats['mean'])}")
         for key in ("num_trajectories", "num_transitions"):
@@ -575,6 +577,7 @@ class FinetuneConfig:
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
     relative_action_targets: bool = False            # Predict cumulative pose offsets from the current UAV state
     future_action_stride: int = 1                    # Raw RLDS step spacing between the T future targets
+    relative_action_wrap_yaw: bool = False           # False matches PAI-0 DeltaActions (plain yaw subtraction)
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -1835,6 +1838,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         window_size=window_size,
         relative_action_targets=cfg.relative_action_targets,
         future_action_stride=cfg.future_action_stride,
+        relative_action_wrap_yaw=cfg.relative_action_wrap_yaw,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1848,6 +1852,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             window_size=window_size,
             relative_action_targets=cfg.relative_action_targets,
             future_action_stride=cfg.future_action_stride,
+            relative_action_wrap_yaw=cfg.relative_action_wrap_yaw,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

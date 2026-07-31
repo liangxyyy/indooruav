@@ -29,6 +29,14 @@ def _trajectory(length=12):
     }
 
 
+def _load_audit_module():
+    audit_path = Path(__file__).parents[1] / "vla-scripts" / "uav_eval" / "audit_stage17_targets.py"
+    spec = importlib.util.spec_from_file_location("stage17_target_audit", audit_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class Stage13TrajectoryTransformTest(unittest.TestCase):
     def test_stride_two_targets_and_future_observations_match(self):
         chunked = chunk_act_obs(
@@ -44,7 +52,7 @@ class Stage13TrajectoryTransformTest(unittest.TestCase):
         np.testing.assert_allclose(relative["action"][0, 2:, 0], [2, 4, 6, 8, 10])
         np.testing.assert_array_equal(relative["future_observation"]["image_primary"][0], [0, 2, 4, 6, 8])
 
-    def test_relative_statistics_flatten_time_and_wrap_yaw(self):
+    def test_relative_statistics_default_matches_pai0_plain_yaw_subtraction(self):
         traj = _trajectory()
         proprio = traj["observation"]["proprio"].numpy()
         action = traj["action"].numpy()
@@ -55,7 +63,51 @@ class Stage13TrajectoryTransformTest(unittest.TestCase):
 
         stats_traj = relative_action_statistics_trajectory(traj, horizon=5, stride=2)
         self.assertEqual(tuple(stats_traj["action"].shape), (15, 4))
+        self.assertAlmostEqual(float(stats_traj["action"][0, 3]), -6.1, places=5)
+
+    def test_relative_statistics_can_wrap_yaw_explicitly(self):
+        traj = _trajectory()
+        proprio = traj["observation"]["proprio"].numpy()
+        action = traj["action"].numpy()
+        proprio[0, 3] = 6.2
+        action[1, 3] = 0.1
+        traj["observation"]["proprio"] = tf.constant(proprio)
+        traj["action"] = tf.constant(action)
+
+        stats_traj = relative_action_statistics_trajectory(traj, horizon=5, stride=2, wrap_yaw=True)
         self.assertAlmostEqual(float(stats_traj["action"][0, 3]), 0.1831853, places=5)
+
+    def test_stride_two_requires_ten_action_entries(self):
+        valid = chunk_act_obs(
+            _trajectory(length=10),
+            window_size=3,
+            future_action_window_size=4,
+            future_action_stride=2,
+            relative_action_targets=True,
+        )
+        too_short = chunk_act_obs(
+            _trajectory(length=9),
+            window_size=3,
+            future_action_window_size=4,
+            future_action_stride=2,
+            relative_action_targets=True,
+        )
+
+        self.assertEqual(int(valid["action"].shape[0]), 1)
+        self.assertEqual(int(too_short["action"].shape[0]), 0)
+
+    def test_audit_target_builder_uses_the_same_offsets(self):
+        audit = _load_audit_module()
+        traj = _trajectory(length=12)
+        targets, indices = audit.build_relative_targets(
+            traj["observation"]["proprio"].numpy(),
+            traj["action"].numpy(),
+            horizon=5,
+            stride=2,
+        )
+
+        np.testing.assert_array_equal(indices[0], [1, 3, 5, 7, 9])
+        np.testing.assert_allclose(targets[0, :, 0], [2, 4, 6, 8, 10])
 
 
 class Stage13InferenceRestoreTest(unittest.TestCase):

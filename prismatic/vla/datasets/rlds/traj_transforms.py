@@ -16,14 +16,25 @@ def _wrap_to_pi(angle: tf.Tensor) -> tf.Tensor:
     return tf.math.floormod(angle + pi, 2.0 * pi) - pi
 
 
-def _relative_pose(absolute_pose: tf.Tensor, origin_pose: tf.Tensor) -> tf.Tensor:
+def _relative_pose(
+    absolute_pose: tf.Tensor,
+    origin_pose: tf.Tensor,
+    wrap_yaw: bool = False,
+) -> tf.Tensor:
     """Expresses absolute (x, y, z, yaw) poses relative to one origin pose."""
     position = absolute_pose[..., :3] - origin_pose[..., :3]
-    yaw = _wrap_to_pi(absolute_pose[..., 3:4] - origin_pose[..., 3:4])
+    yaw = absolute_pose[..., 3:4] - origin_pose[..., 3:4]
+    if wrap_yaw:
+        yaw = _wrap_to_pi(yaw)
     return tf.concat([position, yaw], axis=-1)
 
 
-def relative_action_statistics_trajectory(traj: Dict, horizon: int, stride: int) -> Dict:
+def relative_action_statistics_trajectory(
+    traj: Dict,
+    horizon: int,
+    stride: int,
+    wrap_yaw: bool = False,
+) -> Dict:
     """Builds flattened plan-relative targets used only to compute action statistics."""
     if horizon < 1 or stride < 1:
         raise ValueError("horizon and stride must both be >= 1")
@@ -34,7 +45,7 @@ def relative_action_statistics_trajectory(traj: Dict, horizon: int, stride: int)
     target_indices = tf.range(effective_traj_len)[:, None] + target_offsets[None]
     target_actions = tf.gather(traj["action"], target_indices)
     origins = traj["observation"]["proprio"][:effective_traj_len]
-    relative_actions = _relative_pose(target_actions, origins[:, None])
+    relative_actions = _relative_pose(target_actions, origins[:, None], wrap_yaw=wrap_yaw)
 
     return {
         "action": tf.reshape(relative_actions, [-1, tf.shape(relative_actions)[-1]]),
@@ -42,10 +53,14 @@ def relative_action_statistics_trajectory(traj: Dict, horizon: int, stride: int)
     }
 
 
-def convert_action_chunks_to_relative(traj: Dict, window_size: int) -> Dict:
+def convert_action_chunks_to_relative(
+    traj: Dict,
+    window_size: int,
+    wrap_yaw: bool = False,
+) -> Dict:
     """Converts each absolute action chunk to cumulative offsets from the current state."""
     origins = traj["observation"]["proprio"][:, window_size - 1]
-    traj["action"] = _relative_pose(traj["action"], origins[:, None])
+    traj["action"] = _relative_pose(traj["action"], origins[:, None], wrap_yaw=wrap_yaw)
     traj["absolute_action_mask"] = tf.zeros_like(traj["absolute_action_mask"], dtype=tf.bool)
     return traj
 

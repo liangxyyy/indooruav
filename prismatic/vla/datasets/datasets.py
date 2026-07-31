@@ -160,6 +160,7 @@ class RLDSDataset(IterableDataset):
         window_size: int = 1,
         relative_action_targets: bool = False,
         future_action_stride: int = 1,
+        relative_action_wrap_yaw: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -193,6 +194,7 @@ class RLDSDataset(IterableDataset):
                     "relative_action_targets": relative_action_targets,
                     "relative_action_horizon": NUM_ACTIONS_CHUNK,
                     "relative_action_stride": future_action_stride,
+                    "relative_action_wrap_yaw": relative_action_wrap_yaw,
                 }
             )
         rlds_config = dict(
@@ -201,6 +203,7 @@ class RLDSDataset(IterableDataset):
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 future_action_stride=future_action_stride,          # Raw-step spacing between future targets
                 relative_action_targets=relative_action_targets,    # Cumulative offsets from current UAV state
+                relative_action_wrap_yaw=relative_action_wrap_yaw,  # Match PAI-0 when False
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
             ),

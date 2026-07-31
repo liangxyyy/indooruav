@@ -54,6 +54,7 @@ def make_dataset_from_rlds(
     relative_action_targets: bool = False,
     relative_action_horizon: int = 1,
     relative_action_stride: int = 1,
+    relative_action_wrap_yaw: bool = False,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -234,6 +235,7 @@ def make_dataset_from_rlds(
                     traj_transforms.relative_action_statistics_trajectory,
                     horizon=relative_action_horizon,
                     stride=relative_action_stride,
+                    wrap_yaw=relative_action_wrap_yaw,
                 ),
                 num_parallel_calls,
             )
@@ -246,6 +248,7 @@ def make_dataset_from_rlds(
                     "relative_plan_origin",
                     str(relative_action_horizon),
                     str(relative_action_stride),
+                    str(relative_action_wrap_yaw),
                     inspect.getsource(traj_transforms.relative_action_statistics_trajectory),
                 ),
                 save_dir=builder.data_dir,
@@ -256,6 +259,7 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["representation"] = np.array("relative_plan_origin")
         dataset_statistics["action"]["horizon"] = np.array(relative_action_horizon)
         dataset_statistics["action"]["stride"] = np.array(relative_action_stride)
+        dataset_statistics["action"]["yaw_delta_wrapped"] = np.array(relative_action_wrap_yaw)
 
     # skip normalization for certain action dimensions
     if action_normalization_mask is not None:
@@ -297,6 +301,7 @@ def apply_trajectory_transforms(
     future_action_window_size: int = 0,
     future_action_stride: int = 1,
     relative_action_targets: bool = False,
+    relative_action_wrap_yaw: bool = False,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -383,7 +388,11 @@ def apply_trajectory_transforms(
     )
     if relative_action_targets:
         dataset = dataset.traj_map(
-            partial(traj_transforms.convert_action_chunks_to_relative, window_size=window_size),
+            partial(
+                traj_transforms.convert_action_chunks_to_relative,
+                window_size=window_size,
+                wrap_yaw=relative_action_wrap_yaw,
+            ),
             num_parallel_calls,
         )
 

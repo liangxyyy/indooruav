@@ -190,6 +190,7 @@ class OpenVLAModelService:
         self.cfg.gaussian_log_std_min = getattr(self.vla.config, "gaussian_log_std_min", -5.0)
         self.cfg.gaussian_log_std_max = getattr(self.vla.config, "gaussian_log_std_max", 1.0)
         self.cfg.gaussian_initial_log_std = getattr(self.vla.config, "gaussian_initial_log_std", -0.5)
+        self.cfg.gaussian_learn_log_std = getattr(self.vla.config, "gaussian_learn_log_std", True)
         action_stats = self.vla.norm_stats[self.cfg.unnorm_key]["action"]
         checkpoint_relative_actions = action_stats.get("representation") == "relative_plan_origin"
         self.relative_actions = (

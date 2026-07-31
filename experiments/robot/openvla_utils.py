@@ -515,6 +515,7 @@ def get_action_head(
                 log_std_min=getattr(cfg, "gaussian_log_std_min", -5.0),
                 log_std_max=getattr(cfg, "gaussian_log_std_max", 1.0),
                 initial_log_std=getattr(cfg, "gaussian_initial_log_std", -0.5),
+                learn_log_std=getattr(cfg, "gaussian_learn_log_std", True),
             )
         else:
             action_head = L1RegressionActionHead(**common_args)

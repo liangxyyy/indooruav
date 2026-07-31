@@ -58,6 +58,7 @@ class OpenVLAServer:
         cfg.gaussian_log_std_min = getattr(self.vla.config, "gaussian_log_std_min", -5.0)
         cfg.gaussian_log_std_max = getattr(self.vla.config, "gaussian_log_std_max", 1.0)
         cfg.gaussian_initial_log_std = getattr(self.vla.config, "gaussian_initial_log_std", -0.5)
+        cfg.gaussian_learn_log_std = getattr(self.vla.config, "gaussian_learn_log_std", True)
 
         # Load proprio projector
         self.proprio_projector = None
@@ -147,6 +148,7 @@ class DeployConfig:
     gaussian_log_std_min: float = -5.0
     gaussian_log_std_max: float = 1.0
     gaussian_initial_log_std: float = -0.5
+    gaussian_learn_log_std: bool = True
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
     num_action_branches: int = 1                     # Number of supervised action branches in the action head

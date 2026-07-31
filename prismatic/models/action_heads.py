@@ -134,6 +134,7 @@ class GaussianActionHead(nn.Module):
         log_std_min=-5.0,
         log_std_max=1.0,
         initial_log_std=-0.5,
+        learn_log_std=True,
     ):
         super().__init__()
         if log_std_min >= log_std_max:
@@ -146,17 +147,27 @@ class GaussianActionHead(nn.Module):
         self.use_cond_action_tokens = use_cond_action_tokens
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
+        self.initial_log_std = float(initial_log_std)
+        self.learn_log_std = bool(learn_log_std)
+        parameter_dim = 2 * action_dim if self.learn_log_std else action_dim
         self.model = MLPResNet(
             num_blocks=2,
             input_dim=input_dim if use_cond_action_tokens else input_dim * ACTION_DIM,
             hidden_dim=hidden_dim,
             output_dim=(
-                2 * action_dim
+                parameter_dim
                 if use_cond_action_tokens
-                else 2 * action_dim * num_action_branches
+                else parameter_dim * num_action_branches
             ),
         )
-        self._initialize_log_std_output(initial_log_std)
+        if self.learn_log_std:
+            self._initialize_log_std_output(initial_log_std)
+        else:
+            self.register_buffer(
+                "fixed_log_std",
+                torch.full((action_dim,), self.initial_log_std),
+                persistent=True,
+            )
 
     def _initialize_log_std_output(self, initial_log_std):
         fraction = (initial_log_std - self.log_std_min) / (self.log_std_max - self.log_std_min)
@@ -181,12 +192,15 @@ class GaussianActionHead(nn.Module):
             rearranged = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
             parameters = self.model(rearranged)
             if self.num_action_branches > 1:
+                parameter_dim = 2 * self.action_dim if self.learn_log_std else self.action_dim
                 parameters = parameters.reshape(
                     batch_size,
                     NUM_ACTIONS_CHUNK,
                     self.num_action_branches,
-                    2 * self.action_dim,
+                    parameter_dim,
                 )
+        if not self.learn_log_std:
+            return parameters, self.fixed_log_std.to(parameters.dtype).expand_as(parameters)
         mean, raw_log_std = torch.split(parameters, self.action_dim, dim=-1)
         return mean, self._bound_log_std(raw_log_std)
 

@@ -73,6 +73,25 @@ class GaussianActionHeadTest(unittest.TestCase):
 
         self.assertLess(matching.item(), wrong.item())
 
+    def test_fixed_std_head_only_predicts_means_and_keeps_configured_std(self):
+        head = GaussianActionHead(
+            input_dim=8,
+            hidden_dim=16,
+            action_dim=4,
+            num_action_branches=3,
+            use_cond_action_tokens=True,
+            initial_log_std=-0.5,
+            learn_log_std=False,
+        )
+        hidden = torch.randn(2, 5, 3, 8)
+
+        mean, log_std = head.predict_distribution(hidden)
+
+        self.assertEqual(head.model.fc2.out_features, 4)
+        self.assertEqual(tuple(mean.shape), (2, 5, 3, 4))
+        self.assertTrue(torch.allclose(log_std, torch.full_like(log_std, -0.5)))
+        self.assertFalse(head.fixed_log_std.requires_grad)
+
 
 if __name__ == "__main__":
     unittest.main()

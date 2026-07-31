@@ -652,6 +652,7 @@ class FinetuneConfig:
     gaussian_log_std_min: float = -5.0               # Lower bound for learned Gaussian log standard deviation
     gaussian_log_std_max: float = 1.0                # Upper bound for learned Gaussian log standard deviation
     gaussian_initial_log_std: float = -0.5           # Initial log standard deviation before policy training
+    gaussian_learn_log_std: bool = True              # False keeps BC exploration variance fixed and trains only means
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
     use_best_of_k_action_loss: bool = False          # Assign one winning action branch independently at each future time
@@ -1543,6 +1544,7 @@ def save_training_checkpoint(
             merged_vla.config.gaussian_log_std_min = cfg.gaussian_log_std_min
             merged_vla.config.gaussian_log_std_max = cfg.gaussian_log_std_max
             merged_vla.config.gaussian_initial_log_std = cfg.gaussian_initial_log_std
+            merged_vla.config.gaussian_learn_log_std = cfg.gaussian_learn_log_std
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
@@ -1911,6 +1913,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     "log_std_min": cfg.gaussian_log_std_min,
                     "log_std_max": cfg.gaussian_log_std_max,
                     "initial_log_std": cfg.gaussian_initial_log_std,
+                    "learn_log_std": cfg.gaussian_learn_log_std,
                 }
             )
         action_head = init_module(

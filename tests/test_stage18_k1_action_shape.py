@@ -40,6 +40,25 @@ class Stage18K1ActionShapeTest(unittest.TestCase):
         torch.nn.L1Loss()(predictions, matched_targets).backward()
         self.assertIsNotNone(head.model.fc2.weight.grad)
 
+    def test_overfit_batch_selector_caches_then_cycles(self):
+        fixed_batches = []
+        selected = []
+        for batch_idx in range(8):
+            incoming = {"id": batch_idx}
+            batch = self.finetune.select_overfit_batch(batch_idx, incoming, fixed_batches, 4)
+            selected.append(batch["id"])
+
+        self.assertEqual([batch["id"] for batch in fixed_batches], [0, 1, 2, 3])
+        self.assertEqual(selected, [0, 1, 2, 3, 0, 1, 2, 3])
+
+    def test_overfit_batch_selector_is_disabled_by_default(self):
+        fixed_batches = []
+        incoming = {"id": 9}
+        selected = self.finetune.select_overfit_batch(5, incoming, fixed_batches, 0)
+
+        self.assertIs(selected, incoming)
+        self.assertEqual(fixed_batches, [])
+
 
 if __name__ == "__main__":
     unittest.main()

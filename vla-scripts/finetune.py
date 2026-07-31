@@ -651,6 +651,16 @@ class SingleProcessModuleWrapper(nn.Module):
         return self.module(*args, **kwargs)
 
 
+def select_overfit_batch(batch_idx: int, incoming_batch: dict, fixed_batches: list, batch_count: int):
+    """Cache and cycle a small fixed batch set for an explicit memorization diagnostic."""
+    if batch_count <= 0:
+        return incoming_batch
+    if len(fixed_batches) < batch_count:
+        fixed_batches.append(incoming_batch)
+        return incoming_batch
+    return fixed_batches[batch_idx % batch_count]
+
+
 @dataclass
 class FinetuneConfig:
     # fmt: off
@@ -742,6 +752,8 @@ class FinetuneConfig:
     debug_batch_shapes: bool = False                 # If True, print batch/action/mask shapes for initial batches
     debug_grad_norm: bool = False                    # If True, print gradient norms for trainable components
     debug_num_batches: int = 2                       # Number of initial batches to print when debug flags are enabled
+    overfit_fixed_batch_count: int = 0               # If > 0, repeatedly train on the first N batches (diagnostic only)
+    overfit_report_freq: int = 25                    # Step interval for fixed-batch overfit loss reports
 
     # fmt: on
 
@@ -1722,6 +1734,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("resume and auxiliary_init_checkpoint_path cannot be used together")
     if cfg.reset_action_head and not auxiliary_path_set:
         raise ValueError("reset_action_head requires auxiliary_init_checkpoint_path")
+    if cfg.overfit_fixed_batch_count < 0:
+        raise ValueError("overfit_fixed_batch_count must be >= 0")
+    if cfg.overfit_report_freq < 1:
+        raise ValueError("overfit_report_freq must be >= 1")
     if cfg.num_action_branches < 1:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
@@ -2190,10 +2206,23 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Start training 真正开始训练（核心）
+    fixed_overfit_batches = []
+    overfit_loss_window = deque(maxlen=max(cfg.overfit_fixed_batch_count, 1))
+    if cfg.overfit_fixed_batch_count > 0 and distributed_state.is_main_process:
+        print(
+            "[Overfit diagnostic] Repeating the first "
+            f"{cfg.overfit_fixed_batch_count} batches; this run does not measure generalization."
+        )
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, incoming_batch in enumerate(dataloader):
+            batch = select_overfit_batch(
+                batch_idx,
+                incoming_batch,
+                fixed_overfit_batches,
+                cfg.overfit_fixed_batch_count,
+            )
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
@@ -2278,9 +2307,24 @@ def finetune(cfg: FinetuneConfig) -> None:
             for metric_name, value in metrics.items():
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
+            if cfg.overfit_fixed_batch_count > 0:
+                overfit_loss_window.append(float(metrics["loss_value"]))
 
             # Compute gradient step index
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
+            if (
+                cfg.overfit_fixed_batch_count > 0
+                and gradient_step_boundary
+                and distributed_state.is_main_process
+            ):
+                overfit_step = gradient_step_idx + 1
+                if overfit_step == 1 or overfit_step % cfg.overfit_report_freq == 0:
+                    print(
+                        f"[Overfit diagnostic] step={overfit_step} "
+                        f"cached_batches={len(fixed_overfit_batches)} "
+                        f"recent_mean_loss={sum(overfit_loss_window) / len(overfit_loss_window):.6f}"
+                    )
 
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)

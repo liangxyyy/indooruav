@@ -23,6 +23,10 @@ if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
   exit 1
 fi
 
+: > "${MODEL_LOG}"
+: > "${SIM_LOG}"
+: > "${CONTROLLER_LOG}"
+
 tmux new-session -d -s "${SESSION_NAME}" -n model
 tmux set-environment -t "${SESSION_NAME}" CHECKPOINT "${CHECKPOINT}"
 tmux set-environment -t "${SESSION_NAME}" CONDITION_THRESHOLD "${CONDITION_THRESHOLD}"

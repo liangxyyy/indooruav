@@ -120,6 +120,85 @@ class L1RegressionActionHead(nn.Module):
             action = action.reshape(batch_size, NUM_ACTIONS_CHUNK, self.num_action_branches, self.action_dim)
         return action
 
+
+class GaussianActionHead(nn.Module):
+    """Continuous Gaussian policy head with one diagonal distribution per (time, branch)."""
+
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_action_branches=1,
+        use_cond_action_tokens=False,
+        log_std_min=-5.0,
+        log_std_max=1.0,
+        initial_log_std=-0.5,
+    ):
+        super().__init__()
+        if log_std_min >= log_std_max:
+            raise ValueError("log_std_min must be smaller than log_std_max")
+        if not log_std_min < initial_log_std < log_std_max:
+            raise ValueError("initial_log_std must lie strictly between log_std_min and log_std_max")
+
+        self.action_dim = action_dim
+        self.num_action_branches = num_action_branches
+        self.use_cond_action_tokens = use_cond_action_tokens
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
+        self.model = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim if use_cond_action_tokens else input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=(
+                2 * action_dim
+                if use_cond_action_tokens
+                else 2 * action_dim * num_action_branches
+            ),
+        )
+        self._initialize_log_std_output(initial_log_std)
+
+    def _initialize_log_std_output(self, initial_log_std):
+        fraction = (initial_log_std - self.log_std_min) / (self.log_std_max - self.log_std_min)
+        raw_value = math.atanh(2.0 * fraction - 1.0)
+        output_branches = 1 if self.use_cond_action_tokens else self.num_action_branches
+        with torch.no_grad():
+            for branch_idx in range(output_branches):
+                start = branch_idx * 2 * self.action_dim + self.action_dim
+                end = start + self.action_dim
+                self.model.fc2.weight[start:end].zero_()
+                self.model.fc2.bias[start:end].fill_(raw_value)
+
+    def _bound_log_std(self, raw_log_std):
+        fraction = 0.5 * (torch.tanh(raw_log_std) + 1.0)
+        return self.log_std_min + fraction * (self.log_std_max - self.log_std_min)
+
+    def predict_distribution(self, actions_hidden_states):
+        batch_size = actions_hidden_states.shape[0]
+        if self.use_cond_action_tokens:
+            parameters = self.model(actions_hidden_states)
+        else:
+            rearranged = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+            parameters = self.model(rearranged)
+            if self.num_action_branches > 1:
+                parameters = parameters.reshape(
+                    batch_size,
+                    NUM_ACTIONS_CHUNK,
+                    self.num_action_branches,
+                    2 * self.action_dim,
+                )
+        mean, raw_log_std = torch.split(parameters, self.action_dim, dim=-1)
+        return mean, self._bound_log_std(raw_log_std)
+
+    def predict_action(self, actions_hidden_states):
+        mean, _ = self.predict_distribution(actions_hidden_states)
+        return mean
+
+    def sample_action(self, actions_hidden_states):
+        mean, log_std = self.predict_distribution(actions_hidden_states)
+        return mean + torch.exp(log_std) * torch.randn_like(mean)
+
+
 # 这是diffusion的噪声预测器
 class NoisePredictionModel(nn.Module):
     """

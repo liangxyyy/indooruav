@@ -58,6 +58,10 @@ def build_cfg(args):
         pretrained_checkpoint=args.pretrained_checkpoint,
         use_l1_regression=True,
         use_diffusion=False,
+        use_gaussian_action_head=False,
+        gaussian_log_std_min=-5.0,
+        gaussian_log_std_max=1.0,
+        gaussian_initial_log_std=-0.5,
         num_diffusion_steps_train=50,
         num_diffusion_steps_inference=50,
         num_action_branches=args.num_action_branches,
@@ -181,6 +185,11 @@ class OpenVLAModelService:
         print("Loading OpenVLA base model...", flush=True)
         self.vla = get_vla(self.cfg)
         patch_multimodal_attention_mask_dtype(self.vla)
+        action_head_type = getattr(self.vla.config, "action_head_type", "l1")
+        self.cfg.use_gaussian_action_head = action_head_type == "gaussian"
+        self.cfg.gaussian_log_std_min = getattr(self.vla.config, "gaussian_log_std_min", -5.0)
+        self.cfg.gaussian_log_std_max = getattr(self.vla.config, "gaussian_log_std_max", 1.0)
+        self.cfg.gaussian_initial_log_std = getattr(self.vla.config, "gaussian_initial_log_std", -0.5)
         action_stats = self.vla.norm_stats[self.cfg.unnorm_key]["action"]
         checkpoint_relative_actions = action_stats.get("representation") == "relative_plan_origin"
         self.relative_actions = (
@@ -219,6 +228,7 @@ class OpenVLAModelService:
             f"branches={args.num_action_branches}, "
             f"images={args.num_images_in_input}, "
             f"relative_actions={self.relative_actions}",
+            f"action_head_type={action_head_type}",
             flush=True,
         )
         print("Loading OpenVLA processor...", flush=True)

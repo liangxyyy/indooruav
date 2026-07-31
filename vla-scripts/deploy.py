@@ -53,6 +53,11 @@ class OpenVLAServer:
 
         # Load model
         self.vla = get_vla(cfg)
+        action_head_type = getattr(self.vla.config, "action_head_type", "l1")
+        cfg.use_gaussian_action_head = action_head_type == "gaussian"
+        cfg.gaussian_log_std_min = getattr(self.vla.config, "gaussian_log_std_min", -5.0)
+        cfg.gaussian_log_std_max = getattr(self.vla.config, "gaussian_log_std_max", 1.0)
+        cfg.gaussian_initial_log_std = getattr(self.vla.config, "gaussian_initial_log_std", -0.5)
 
         # Load proprio projector
         self.proprio_projector = None
@@ -138,6 +143,10 @@ class DeployConfig:
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
+    use_gaussian_action_head: bool = False           # Auto-detected from local checkpoint metadata
+    gaussian_log_std_min: float = -5.0
+    gaussian_log_std_max: float = 1.0
+    gaussian_initial_log_std: float = -0.5
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
     num_action_branches: int = 1                     # Number of supervised action branches in the action head

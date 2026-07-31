@@ -51,6 +51,7 @@ class RLDSBatchTransform:
     num_images_in_input: int = 1
     require_full_image_history: bool = False
     use_cond_action_tokens: bool = False
+    load_future_images: bool = False
     num_action_branches: int = 1
 
     def _build_cond_action_string(self) -> str:
@@ -137,7 +138,7 @@ class RLDSBatchTransform:
             return_dict["proprio"] = proprio
         if self.use_image_history:
             return_dict["image_history_pad_mask"] = rlds_batch["observation"].get("pad_mask")
-        if self.use_cond_action_tokens and "future_observation" in rlds_batch:
+        if self.load_future_images and "future_observation" in rlds_batch:
             future_images = rlds_batch["future_observation"]["image_primary"][:NUM_ACTIONS_CHUNK]
             return_dict["future_pixel_values"] = torch.stack(
                 [self.image_transform(Image.fromarray(image)) for image in future_images],

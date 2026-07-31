@@ -4,6 +4,7 @@ finetune.py
 Fine-tunes OpenVLA via LoRA.
 """
 
+import math
 import os
 import time
 from collections import deque
@@ -37,7 +38,7 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.action_heads import DiffusionActionHead, GaussianActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -238,6 +239,62 @@ def compute_best_of_k_action_loss(
         winner_indices, num_classes=predicted_actions.shape[2]
     ).float()
     for branch_idx in range(predicted_actions.shape[2]):
+        metrics[f"branch{branch_idx}_winner_rate"] = hard_assignments[..., branch_idx].mean().item()
+        metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
+
+    return best_of_k_loss, branch_balance_loss, winner_indices, metrics
+
+
+def diagonal_gaussian_nll(
+    mean: torch.Tensor,
+    log_std: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Elementwise negative log likelihood for a diagonal Gaussian policy."""
+    mean = mean.float()
+    log_std = log_std.float()
+    target = target.float()
+    squared_error = torch.square((target - mean) * torch.exp(-log_std))
+    return 0.5 * squared_error + log_std + 0.5 * math.log(2.0 * math.pi)
+
+
+def compute_best_of_k_gaussian_action_loss(
+    action_mean: torch.Tensor,
+    action_log_std: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    assignment_temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Assigns each (batch, time) target to the Gaussian branch with the lowest NLL."""
+    if action_mean.ndim != 4 or action_log_std.shape != action_mean.shape:
+        raise ValueError("Gaussian best-of-K requires matching (B, T, K, action_dim) tensors")
+    if assignment_temperature <= 0:
+        raise ValueError("assignment_temperature must be > 0")
+
+    targets = ground_truth_actions.unsqueeze(2).expand_as(action_mean)
+    per_time_branch_nll = diagonal_gaussian_nll(action_mean, action_log_std, targets).mean(dim=-1)
+    winner_indices = per_time_branch_nll.detach().argmin(dim=2)
+    winner_nll = per_time_branch_nll.gather(2, winner_indices.unsqueeze(2)).squeeze(2)
+    best_of_k_loss = winner_nll.mean()
+
+    assignment_probabilities = torch.softmax(-per_time_branch_nll / assignment_temperature, dim=2)
+    branch_usage = assignment_probabilities.mean(dim=(0, 1))
+    uniform_usage = torch.full_like(branch_usage, 1.0 / action_mean.shape[2])
+    branch_balance_loss = torch.sum(
+        branch_usage * torch.log((branch_usage + 1e-8) / uniform_usage)
+    )
+    assignment_entropy = -torch.sum(
+        assignment_probabilities * torch.log(assignment_probabilities + 1e-8), dim=2
+    ).mean()
+
+    metrics = {
+        "best_of_k_gaussian_nll": best_of_k_loss.item(),
+        "branch_balance_loss": branch_balance_loss.item(),
+        "branch_assignment_entropy": assignment_entropy.item(),
+    }
+    hard_assignments = torch.nn.functional.one_hot(
+        winner_indices, num_classes=action_mean.shape[2]
+    ).float()
+    for branch_idx in range(action_mean.shape[2]):
         metrics[f"branch{branch_idx}_winner_rate"] = hard_assignments[..., branch_idx].mean().item()
         metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
 
@@ -582,6 +639,10 @@ class FinetuneConfig:
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
+    use_gaussian_action_head: bool = False           # If True, optimize a diagonal Gaussian policy with NLL
+    gaussian_log_std_min: float = -5.0               # Lower bound for learned Gaussian log standard deviation
+    gaussian_log_std_max: float = 1.0                # Upper bound for learned Gaussian log standard deviation
+    gaussian_initial_log_std: float = -0.5           # Initial log standard deviation before policy training
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_action_branches: int = 1                     # Number of supervised action branches to predict for L1 regression
     use_best_of_k_action_loss: bool = False          # Assign one winning action branch independently at each future time
@@ -624,6 +685,9 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint 断点重训，从checkpoint继续训练
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    auxiliary_init_checkpoint_path: Optional[Path] = None  # Load external projectors/heads without resuming LoRA
+    auxiliary_init_checkpoint_step: Optional[int] = None   # Component step inside auxiliary_init_checkpoint_path
+    reset_action_head: bool = False                  # Do not load action_head from auxiliary initialization checkpoint
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -793,6 +857,21 @@ def init_module(
     if cfg.resume:
         state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
         module.load_state_dict(state_dict)
+        print(f"Initialized {module_name} from resume checkpoint step {cfg.resume_step}")
+    elif cfg.auxiliary_init_checkpoint_path is not None:
+        if module_name == "action_head" and cfg.reset_action_head:
+            print("Resetting action_head; auxiliary action-head weights were intentionally not loaded")
+        else:
+            state_dict = load_checkpoint(
+                module_name,
+                str(cfg.auxiliary_init_checkpoint_path),
+                cfg.auxiliary_init_checkpoint_step,
+            )
+            module.load_state_dict(state_dict)
+            print(
+                f"Initialized {module_name} from auxiliary checkpoint "
+                f"{cfg.auxiliary_init_checkpoint_path} step {cfg.auxiliary_init_checkpoint_step}"
+            )
 
     if to_bf16:
         module = module.to(torch.bfloat16)
@@ -811,6 +890,7 @@ def run_forward_pass(
     device_id,
     use_l1_regression,
     use_diffusion,
+    use_gaussian_action_head,
     num_action_branches,
     use_best_of_k_action_loss,
     branch_assignment_temperature,
@@ -1008,13 +1088,45 @@ def run_forward_pass(
             )
 
         if use_l1_regression:
-            # Predict action,输出的是(B, NUM_ACTIONS_CHUNK, ACTION_DIM)的连续动作=(B,8,7)
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            if use_gaussian_action_head:
+                predicted_actions, action_log_std = action_head.module.predict_distribution(actions_hidden_states)
+            else:
+                predicted_actions = action_head.module.predict_action(actions_hidden_states)
+                action_log_std = None
             if debug_batch_shapes:
                 debug_info["predicted_actions"] = _shape(predicted_actions)
                 debug_info["predicted_actions_device"] = _device(predicted_actions)
-            # Assign one expert target to one branch at each future time.
-            if predicted_actions.ndim == 4 and use_best_of_k_action_loss:
+                debug_info["action_log_std"] = _shape(action_log_std)
+                debug_info["action_log_std_device"] = _device(action_log_std)
+
+            if use_gaussian_action_head and predicted_actions.ndim == 4 and use_best_of_k_action_loss:
+                (
+                    loss,
+                    branch_balance_loss,
+                    action_winner_indices,
+                    assignment_metrics,
+                ) = compute_best_of_k_gaussian_action_loss(
+                    predicted_actions,
+                    action_log_std,
+                    ground_truth_actions,
+                    branch_assignment_temperature,
+                )
+                loss = loss + branch_balance_weight * branch_balance_loss
+                metrics.update(assignment_metrics)
+            elif use_gaussian_action_head:
+                if predicted_actions.ndim == 4:
+                    ground_truth_actions_for_loss = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
+                else:
+                    ground_truth_actions_for_loss = ground_truth_actions
+                gaussian_nll = diagonal_gaussian_nll(
+                    predicted_actions,
+                    action_log_std,
+                    ground_truth_actions_for_loss,
+                ).mean()
+                loss = gaussian_nll
+                metrics["gaussian_nll_loss"] = gaussian_nll.item()
+            # Assign one expert target to one deterministic branch at each future time.
+            elif predicted_actions.ndim == 4 and use_best_of_k_action_loss:
                 (
                     loss,
                     branch_balance_loss,
@@ -1034,7 +1146,17 @@ def run_forward_pass(
                 ground_truth_actions_for_loss = ground_truth_actions
                 loss = torch.nn.L1Loss()(ground_truth_actions_for_loss, predicted_actions)
 
-            if cond_hidden_states is not None:
+            if action_log_std is not None:
+                metrics.update(
+                    {
+                        "gaussian_log_std_mean": action_log_std.float().mean().item(),
+                        "gaussian_log_std_min": action_log_std.float().min().item(),
+                        "gaussian_log_std_max": action_log_std.float().max().item(),
+                        "gaussian_policy_std_mean": torch.exp(action_log_std.float()).mean().item(),
+                    }
+                )
+
+            if cond_hidden_states is not None and future_pixel_values is not None:
                 selected_condition_branches = (
                     action_winner_indices if couple_condition_to_action_branch else None
                 )
@@ -1401,6 +1523,15 @@ def save_training_checkpoint(
         merged_vla.config.condition_patch_topk = cfg.condition_patch_topk
         merged_vla.config.condition_matching_centered = True
         merged_vla.config.condition_contrastive_mode = "per_time_branch_selection"
+        merged_vla.config.action_head_type = (
+            "gaussian" if cfg.use_gaussian_action_head else ("diffusion" if cfg.use_diffusion else "l1")
+        )
+        merged_vla.config.num_action_branches = cfg.num_action_branches
+        merged_vla.config.use_cond_action_tokens = cfg.use_cond_action_tokens
+        if cfg.use_gaussian_action_head:
+            merged_vla.config.gaussian_log_std_min = cfg.gaussian_log_std_min
+            merged_vla.config.gaussian_log_std_max = cfg.gaussian_log_std_max
+            merged_vla.config.gaussian_initial_log_std = cfg.gaussian_initial_log_std
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
@@ -1468,6 +1599,7 @@ def run_validation(
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                use_gaussian_action_head=cfg.use_gaussian_action_head,
                 num_action_branches=cfg.num_action_branches,
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,
@@ -1542,6 +1674,22 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    if cfg.use_gaussian_action_head and not cfg.use_l1_regression:
+        raise ValueError("use_gaussian_action_head requires use_l1_regression=True")
+    if cfg.gaussian_log_std_min >= cfg.gaussian_log_std_max:
+        raise ValueError("gaussian_log_std_min must be smaller than gaussian_log_std_max")
+    if not cfg.gaussian_log_std_min < cfg.gaussian_initial_log_std < cfg.gaussian_log_std_max:
+        raise ValueError("gaussian_initial_log_std must lie strictly inside the configured bounds")
+    auxiliary_path_set = cfg.auxiliary_init_checkpoint_path is not None
+    auxiliary_step_set = cfg.auxiliary_init_checkpoint_step is not None
+    if auxiliary_path_set != auxiliary_step_set:
+        raise ValueError(
+            "auxiliary_init_checkpoint_path and auxiliary_init_checkpoint_step must be provided together"
+        )
+    if cfg.resume and auxiliary_path_set:
+        raise ValueError("resume and auxiliary_init_checkpoint_path cannot be used together")
+    if cfg.reset_action_head and not auxiliary_path_set:
+        raise ValueError("reset_action_head requires auxiliary_init_checkpoint_path")
     if cfg.num_action_branches < 1:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
@@ -1595,6 +1743,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError(
             "The current GRPO loss treats K as whole-trajectory branches and is incompatible "
             "with per-time best-of-K; set grpo_reward_weight=0 for Stage14"
+        )
+    if cfg.grpo_reward_weight > 0 and cfg.use_gaussian_action_head:
+        raise ValueError(
+            "The legacy fixed-sigma GRPO surrogate is disabled for Gaussian policies; "
+            "Stage19 will use sampled actions and exact policy log-probabilities"
         )
     if cfg.grpo_policy_sigma <= 0:
         raise ValueError("grpo_policy_sigma must be > 0")
@@ -1720,18 +1873,28 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
+        action_head_class = GaussianActionHead if cfg.use_gaussian_action_head else L1RegressionActionHead
+        action_head_args = {
+            "input_dim": vla.module.llm_dim,
+            "hidden_dim": vla.module.llm_dim,
+            "action_dim": ACTION_DIM,
+            "num_action_branches": cfg.num_action_branches,
+            "use_cond_action_tokens": cfg.use_cond_action_tokens,
+        }
+        if cfg.use_gaussian_action_head:
+            action_head_args.update(
+                {
+                    "log_std_min": cfg.gaussian_log_std_min,
+                    "log_std_max": cfg.gaussian_log_std_max,
+                    "initial_log_std": cfg.gaussian_initial_log_std,
+                }
+            )
         action_head = init_module(
-            L1RegressionActionHead,
+            action_head_class,
             "action_head",
             cfg,
             device_id,
-            {
-                "input_dim": vla.module.llm_dim,
-                "hidden_dim": vla.module.llm_dim,
-                "action_dim": ACTION_DIM,
-                "num_action_branches": cfg.num_action_branches,
-                "use_cond_action_tokens": cfg.use_cond_action_tokens,
-            },
+            action_head_args,
             to_bf16=True,
         )
 
@@ -1826,6 +1989,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         num_images_in_input=cfg.num_images_in_input,
         require_full_image_history=cfg.require_full_image_history,
         use_cond_action_tokens=cfg.use_cond_action_tokens,
+        load_future_images=(
+            cfg.use_cond_action_tokens
+            and (
+                cfg.condition_alignment_weight > 0
+                or cfg.condition_contrastive_weight > 0
+                or cfg.condition_diversity_weight > 0
+            )
+        ),
         num_action_branches=cfg.num_action_branches,
     )
     train_dataset = RLDSDataset(
@@ -1899,6 +2070,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         "best_branch_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_of_k_time_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_of_k_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "best_of_k_gaussian_nll": deque(maxlen=cfg.grad_accumulation_steps),
+        "gaussian_nll_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "gaussian_log_std_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "gaussian_log_std_min": deque(maxlen=cfg.grad_accumulation_steps),
+        "gaussian_log_std_max": deque(maxlen=cfg.grad_accumulation_steps),
+        "gaussian_policy_std_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_balance_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "branch_assignment_entropy": deque(maxlen=cfg.grad_accumulation_steps),
         "branch0_winner_rate": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1982,6 +2159,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                use_gaussian_action_head=cfg.use_gaussian_action_head,
                 num_action_branches=cfg.num_action_branches,
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,

@@ -306,20 +306,59 @@ def compute_best_of_k_gaussian_action_loss(
     action_log_std: torch.Tensor,
     ground_truth_actions: torch.Tensor,
     assignment_temperature: float,
+    condition_similarities: Optional[torch.Tensor] = None,
+    condition_assignment_weight: float = 0.0,
+    condition_loss_start_time_index: int = 0,
+    initial_action_branch_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
-    """Assigns each (batch, time) target to the Gaussian branch with the lowest NLL."""
+    """Assign each (batch, time) target to one paired condition-action branch."""
     if action_mean.ndim != 4 or action_log_std.shape != action_mean.shape:
         raise ValueError("Gaussian best-of-K requires matching (B, T, K, action_dim) tensors")
     if assignment_temperature <= 0:
         raise ValueError("assignment_temperature must be > 0")
+    if condition_assignment_weight < 0:
+        raise ValueError("condition_assignment_weight must be >= 0")
+    if not 0 <= condition_loss_start_time_index < action_mean.shape[1]:
+        raise ValueError("condition_loss_start_time_index is outside the action horizon")
+    if initial_action_branch_index is not None and not 0 <= initial_action_branch_index < action_mean.shape[2]:
+        raise ValueError("initial_action_branch_index is outside the K action branches")
 
     targets = ground_truth_actions.unsqueeze(2).expand_as(action_mean)
     per_time_branch_nll = diagonal_gaussian_nll(action_mean, action_log_std, targets).mean(dim=-1)
-    winner_indices = per_time_branch_nll.detach().argmin(dim=2)
+    assignment_cost = per_time_branch_nll
+    if condition_assignment_weight > 0:
+        if condition_similarities is None:
+            raise ValueError("condition similarities are required for joint condition-action assignment")
+        if condition_similarities.shape != per_time_branch_nll.shape:
+            raise ValueError(
+                "condition similarities must match Gaussian branch costs, got "
+                f"{tuple(condition_similarities.shape)} and {tuple(per_time_branch_nll.shape)}"
+            )
+        condition_cost = 1.0 - condition_similarities.float()
+        condition_mask = torch.zeros_like(condition_cost)
+        condition_mask[:, condition_loss_start_time_index:] = 1.0
+        assignment_cost = per_time_branch_nll + condition_assignment_weight * condition_cost * condition_mask
+
+    winner_indices = assignment_cost.detach().argmin(dim=2)
+    if initial_action_branch_index is not None:
+        winner_indices = winner_indices.clone()
+        winner_indices[:, 0] = initial_action_branch_index
     winner_nll = per_time_branch_nll.gather(2, winner_indices.unsqueeze(2)).squeeze(2)
     best_of_k_loss = winner_nll.mean()
 
-    assignment_probabilities = torch.softmax(-per_time_branch_nll / assignment_temperature, dim=2)
+    assignment_probabilities = torch.softmax(-assignment_cost / assignment_temperature, dim=2)
+    if initial_action_branch_index is not None:
+        fixed_initial_assignment = torch.nn.functional.one_hot(
+            torch.full(
+                (action_mean.shape[0],),
+                initial_action_branch_index,
+                device=action_mean.device,
+                dtype=torch.long,
+            ),
+            num_classes=action_mean.shape[2],
+        ).to(assignment_probabilities.dtype)
+        assignment_probabilities = assignment_probabilities.clone()
+        assignment_probabilities[:, 0] = fixed_initial_assignment
     branch_usage = assignment_probabilities.mean(dim=(0, 1))
     uniform_usage = torch.full_like(branch_usage, 1.0 / action_mean.shape[2])
     branch_balance_loss = torch.sum(
@@ -331,9 +370,15 @@ def compute_best_of_k_gaussian_action_loss(
 
     metrics = {
         "best_of_k_gaussian_nll": best_of_k_loss.item(),
+        "joint_assignment_cost": assignment_cost.gather(
+            2, winner_indices.unsqueeze(2)
+        ).mean().item(),
+        "joint_condition_assignment_weight": float(condition_assignment_weight),
         "branch_balance_loss": branch_balance_loss.item(),
         "branch_assignment_entropy": assignment_entropy.item(),
     }
+    if initial_action_branch_index is not None:
+        metrics["initial_action_branch_index"] = float(initial_action_branch_index)
     hard_assignments = torch.nn.functional.one_hot(
         winner_indices, num_classes=action_mean.shape[2]
     ).float()
@@ -342,6 +387,44 @@ def compute_best_of_k_gaussian_action_loss(
         metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
 
     return best_of_k_loss, branch_balance_loss, winner_indices, metrics
+
+
+def compute_condition_similarity_tensors(
+    vla,
+    cond_hidden_states: torch.Tensor,
+    future_pixel_values: Optional[torch.Tensor],
+    patch_topk: int,
+    use_film: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+    """Encode future observations once and return all per-time, per-branch similarities."""
+    if cond_hidden_states is None or future_pixel_values is None:
+        return None, None, {}
+    if use_film:
+        return None, None, {"condition_alignment_skipped_film": 1.0}
+
+    base_vla = _unwrap_vla_model(vla)
+    vision_backbone = base_vla.vision_backbone
+    old_num_images = vision_backbone.get_num_images_in_input()
+
+    with torch.no_grad():
+        batch_size, horizon, channels, height, width = future_pixel_values.shape
+        future_images = future_pixel_values.reshape(batch_size * horizon, channels, height, width)
+        try:
+            vision_backbone.set_num_images_in_input(1)
+            future_patch_embeddings = base_vla._process_vision_features(future_images, use_film=False)
+        finally:
+            vision_backbone.set_num_images_in_input(old_num_images)
+
+        future_patch_embeddings = future_patch_embeddings.float().reshape(
+            batch_size, horizon, future_patch_embeddings.shape[1], -1
+        ).detach()
+
+    similarities = condition_to_patch_similarity(
+        cond_hidden_states,
+        future_patch_embeddings,
+        patch_topk,
+    )
+    return similarities, future_patch_embeddings, {}
 
 
 def compute_condition_contrastive_loss(
@@ -378,37 +461,34 @@ def compute_condition_alignment_loss_and_metrics(
     loss_start_time_index: int = 0,
     patch_topk: int = 8,
     use_film: bool = False,
+    precomputed_similarities: Optional[torch.Tensor] = None,
+    precomputed_future_patch_embeddings: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
     if cond_hidden_states is None or future_pixel_values is None:
         return None, None, None, {}
     if use_film:
         return None, None, None, {"condition_alignment_skipped_film": 1.0}
 
-    base_vla = _unwrap_vla_model(vla)
-    vision_backbone = base_vla.vision_backbone
-    old_num_images = vision_backbone.get_num_images_in_input()
-
-    with torch.no_grad():
-        batch_size, horizon, channels, height, width = future_pixel_values.shape
-        future_images = future_pixel_values.reshape(batch_size * horizon, channels, height, width)
-        try:
-            vision_backbone.set_num_images_in_input(1)
-            future_patch_embeddings = base_vla._process_vision_features(future_images, use_film=False)
-        finally:
-            vision_backbone.set_num_images_in_input(old_num_images)
-
-        future_patch_embeddings = future_patch_embeddings.float().reshape(
-            batch_size, horizon, future_patch_embeddings.shape[1], -1
-        ).detach()
+    if (precomputed_similarities is None) != (precomputed_future_patch_embeddings is None):
+        raise ValueError("precomputed condition similarities and patch embeddings must be provided together")
+    if precomputed_similarities is None:
+        similarities, future_patch_embeddings, precompute_metrics = compute_condition_similarity_tensors(
+            vla=vla,
+            cond_hidden_states=cond_hidden_states,
+            future_pixel_values=future_pixel_values,
+            patch_topk=patch_topk,
+            use_film=use_film,
+        )
+        if similarities is None:
+            return None, None, None, precompute_metrics
+    else:
+        similarities = precomputed_similarities
+        future_patch_embeddings = precomputed_future_patch_embeddings
 
     cond_embeddings = torch.nn.functional.normalize(cond_hidden_states.float(), dim=-1)
     centered_cond_embeddings = center_condition_branches(cond_hidden_states)
     centered_future_patch_embeddings = center_visual_patches(future_patch_embeddings)
-    similarities = condition_to_patch_similarity(
-        cond_hidden_states,
-        future_patch_embeddings,
-        patch_topk,
-    )
+    horizon = similarities.shape[1]
     if not 0 <= loss_start_time_index < horizon:
         raise ValueError(
             f"condition loss start index must be in [0, {horizon}), got {loss_start_time_index}"
@@ -644,6 +724,106 @@ def compute_grpo_branch_loss(
     return grpo_loss, metrics
 
 
+def compute_gaussian_group_relative_policy_loss(
+    action_mean: torch.Tensor,
+    action_log_std: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    action_norm_stats: Optional[dict],
+    selected_branch_indices: torch.Tensor,
+    group_size: int,
+    advantage_eps: float,
+    advantage_clip: float,
+    clip_epsilon: float,
+    safety_weight: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """On-policy group-relative objective using exact diagonal-Gaussian log probabilities.
+
+    G samples are drawn independently from the selected policy at every (batch, time)
+    slot. G is deliberately independent of K: K is the number of structured
+    condition-action alternatives, while G is the policy-optimization sample group.
+    """
+    if action_mean.ndim != 4 or action_log_std.shape != action_mean.shape:
+        raise ValueError("Gaussian group-relative loss requires matching (B,T,K,D) tensors")
+    if selected_branch_indices.shape != action_mean.shape[:2]:
+        raise ValueError("selected branch indices must have shape (B,T)")
+    if group_size < 2:
+        raise ValueError("GRPO group_size must be >= 2")
+    if advantage_eps <= 0 or advantage_clip <= 0:
+        raise ValueError("GRPO advantage constants must be > 0")
+    if not 0 < clip_epsilon < 1:
+        raise ValueError("GRPO clip_epsilon must lie in (0, 1)")
+    if safety_weight < 0:
+        raise ValueError("GRPO safety_weight must be >= 0")
+
+    gather_index = selected_branch_indices.detach().long().unsqueeze(2).unsqueeze(3).expand(
+        -1, -1, 1, action_mean.shape[-1]
+    )
+    selected_mean = action_mean.float().gather(2, gather_index).squeeze(2)
+    selected_log_std = action_log_std.float().gather(2, gather_index).squeeze(2)
+
+    sample_noise = torch.randn(
+        *selected_mean.shape[:2],
+        group_size,
+        selected_mean.shape[-1],
+        device=selected_mean.device,
+        dtype=selected_mean.dtype,
+    )
+    sampled_actions = selected_mean.unsqueeze(2) + torch.exp(selected_log_std).unsqueeze(2) * sample_noise
+    policy_samples = sampled_actions.detach()
+    expanded_mean = selected_mean.unsqueeze(2).expand_as(policy_samples)
+    expanded_log_std = selected_log_std.unsqueeze(2).expand_as(policy_samples)
+    log_prob = -diagonal_gaussian_nll(
+        expanded_mean,
+        expanded_log_std,
+        policy_samples,
+    ).sum(dim=-1)
+
+    with torch.no_grad():
+        sampled_real = _unnormalize_actions_for_reward(policy_samples, action_norm_stats)
+        target_real = _unnormalize_actions_for_reward(
+            ground_truth_actions.float(), action_norm_stats
+        ).unsqueeze(2)
+        position_error = torch.linalg.vector_norm(
+            sampled_real[..., :3] - target_real[..., :3], dim=-1
+        )
+        yaw_error = _wrapped_abs_yaw_error(sampled_real[..., 3], target_real[..., 3])
+        # Normalized values beyond [-1, 1] leave the robust training envelope.
+        safety_violation = torch.relu(policy_samples.abs() - 1.0).mean(dim=-1)
+        rewards = -position_error - 0.25 * yaw_error - safety_weight * safety_violation
+        reward_mean = rewards.mean(dim=2, keepdim=True)
+        reward_std = rewards.std(dim=2, keepdim=True, unbiased=False)
+        advantages = (rewards - reward_mean) / (reward_std + advantage_eps)
+        advantages = advantages.clamp(min=-advantage_clip, max=advantage_clip)
+
+    old_log_prob = log_prob.detach()
+    ratio = torch.exp(log_prob - old_log_prob)
+    unclipped_objective = ratio * advantages
+    clipped_objective = torch.clamp(
+        ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon
+    ) * advantages
+    policy_loss = -torch.minimum(unclipped_objective, clipped_objective).mean()
+
+    metrics = {
+        "grpo_loss": policy_loss.item(),
+        # The clipped on-policy surrogate has value ~0 because group advantages
+        # are centered, while its gradient is nonzero. This detached proxy is
+        # easier to interpret in logs without changing the optimized objective.
+        "grpo_logprob_objective_proxy": (-(advantages * log_prob.detach()).mean()).item(),
+        "grpo_group_size": float(group_size),
+        "grpo_reward_mean": rewards.mean().item(),
+        "grpo_reward_best": rewards.max(dim=2).values.mean().item(),
+        "grpo_reward_std": rewards.std(unbiased=False).item(),
+        "grpo_advantage_mean": advantages.mean().item(),
+        "grpo_advantage_std": advantages.std(unbiased=False).item(),
+        "grpo_exact_log_prob_mean": log_prob.mean().item(),
+        "grpo_probability_ratio_mean": ratio.mean().item(),
+        "grpo_position_error_mean": position_error.mean().item(),
+        "grpo_yaw_error_mean": yaw_error.mean().item(),
+        "grpo_safety_violation_rate": (safety_violation > 0).float().mean().item(),
+    }
+    return policy_loss, metrics
+
+
 def _distributed_is_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -710,6 +890,8 @@ class FinetuneConfig:
     use_best_of_k_action_loss: bool = False          # Assign one winning action branch independently at each future time
     branch_assignment_temperature: float = 0.1       # Soft assignment temperature used by branch balancing
     branch_balance_weight: float = 0.0               # Weight for uniform branch utilization regularization
+    condition_assignment_weight: float = 0.0         # Condition cost used when assigning each paired branch
+    initial_action_branch_index: int = -1             # Fixed branch at t=0; -1 keeps unconstrained best-of-K
     use_cond_action_tokens: bool = False             # If True, use explicit T x K COND/ACT placeholder tokens
     couple_condition_to_action_branch: bool = False  # Align the condition that belongs to the winning action branch
     condition_similarity_threshold: float = 0.2      # Threshold used only for condition-alignment diagnostics
@@ -723,7 +905,10 @@ class FinetuneConfig:
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
     branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
     grpo_reward_weight: float = 0.0                  # Weight for GRPO-style branch reward optimization
-    grpo_policy_sigma: float = 1.0                   # Fixed Gaussian sigma for continuous-action GRPO surrogate
+    grpo_policy_sigma: float = 1.0                   # Deprecated legacy fixed-sigma setting; retained for old configs
+    grpo_group_size: int = 4                         # Policy samples G per selected (time, branch), independent of K
+    grpo_clip_epsilon: float = 0.2                   # PPO-style clipping range for exact Gaussian log-prob ratios
+    grpo_safety_weight: float = 0.2                  # Penalty for sampled actions outside the normalized data envelope
     grpo_advantage_eps: float = 1e-4                 # Numerical stability constant for group advantage normalization
     grpo_advantage_clip: float = 5.0                 # Clips group-relative advantages before applying GRPO loss
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -964,10 +1149,15 @@ def run_forward_pass(
     use_best_of_k_action_loss,
     branch_assignment_temperature,
     branch_balance_weight,
+    condition_assignment_weight,
+    initial_action_branch_index,
     branch_diversity_weight,
     branch_diversity_margin,
     grpo_reward_weight,
     grpo_policy_sigma,
+    grpo_group_size,
+    grpo_clip_epsilon,
+    grpo_safety_weight,
     grpo_advantage_eps,
     grpo_advantage_clip,
     use_proprio,
@@ -1031,6 +1221,8 @@ def run_forward_pass(
     condition_alignment_loss = None
     condition_contrastive_loss = None
     condition_diversity_loss = None
+    condition_similarities = None
+    future_patch_embeddings = None
     action_winner_indices = None
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network. 如果使用diffusion，先给动作加噪声
@@ -1168,6 +1360,20 @@ def run_forward_pass(
                 debug_info["action_log_std"] = _shape(action_log_std)
                 debug_info["action_log_std_device"] = _device(action_log_std)
 
+            if cond_hidden_states is not None and future_pixel_values is not None:
+                (
+                    condition_similarities,
+                    future_patch_embeddings,
+                    condition_precompute_metrics,
+                ) = compute_condition_similarity_tensors(
+                    vla=vla,
+                    cond_hidden_states=cond_hidden_states,
+                    future_pixel_values=future_pixel_values,
+                    patch_topk=condition_patch_topk,
+                    use_film=use_film,
+                )
+                metrics.update(condition_precompute_metrics)
+
             if use_gaussian_action_head and predicted_actions.ndim == 4 and use_best_of_k_action_loss:
                 (
                     loss,
@@ -1179,6 +1385,12 @@ def run_forward_pass(
                     action_log_std,
                     ground_truth_actions,
                     branch_assignment_temperature,
+                    condition_similarities=condition_similarities,
+                    condition_assignment_weight=condition_assignment_weight,
+                    condition_loss_start_time_index=condition_loss_start_time_index,
+                    initial_action_branch_index=(
+                        initial_action_branch_index if initial_action_branch_index >= 0 else None
+                    ),
                 )
                 loss = loss + branch_balance_weight * branch_balance_loss
                 metrics.update(assignment_metrics)
@@ -1244,6 +1456,8 @@ def run_forward_pass(
                     loss_start_time_index=condition_loss_start_time_index,
                     patch_topk=condition_patch_topk,
                     use_film=use_film,
+                    precomputed_similarities=condition_similarities,
+                    precomputed_future_patch_embeddings=future_patch_embeddings,
                 )
                 metrics.update(condition_metrics)
             if condition_alignment_loss is not None and condition_alignment_weight > 0:
@@ -1272,13 +1486,19 @@ def run_forward_pass(
                     }
                 )
             if predicted_actions.ndim == 4 and grpo_reward_weight > 0:
-                grpo_loss, grpo_metrics = compute_grpo_branch_loss(
-                    predicted_actions=predicted_actions,
+                if action_log_std is None or action_winner_indices is None:
+                    raise ValueError("Gaussian GRPO requires a selected branch and action log standard deviation")
+                grpo_loss, grpo_metrics = compute_gaussian_group_relative_policy_loss(
+                    action_mean=predicted_actions,
+                    action_log_std=action_log_std,
                     ground_truth_actions=ground_truth_actions,
                     action_norm_stats=action_norm_stats,
+                    selected_branch_indices=action_winner_indices,
+                    group_size=grpo_group_size,
                     advantage_eps=grpo_advantage_eps,
                     advantage_clip=grpo_advantage_clip,
-                    policy_sigma=grpo_policy_sigma,
+                    clip_epsilon=grpo_clip_epsilon,
+                    safety_weight=grpo_safety_weight,
                 )
                 loss = loss + grpo_reward_weight * grpo_loss
                 metrics.update(grpo_metrics)
@@ -1596,6 +1816,12 @@ def save_training_checkpoint(
         )
         merged_vla.config.num_action_branches = cfg.num_action_branches
         merged_vla.config.use_cond_action_tokens = cfg.use_cond_action_tokens
+        merged_vla.config.condition_action_pairing = "per_time_joint_assignment"
+        merged_vla.config.condition_assignment_weight = cfg.condition_assignment_weight
+        merged_vla.config.initial_action_branch_index = cfg.initial_action_branch_index
+        merged_vla.config.condition_loss_start_time_index = cfg.condition_loss_start_time_index
+        merged_vla.config.grpo_group_size = cfg.grpo_group_size
+        merged_vla.config.grpo_exact_gaussian_log_prob = True
         if cfg.use_gaussian_action_head:
             merged_vla.config.gaussian_log_std_min = cfg.gaussian_log_std_min
             merged_vla.config.gaussian_log_std_max = cfg.gaussian_log_std_max
@@ -1674,10 +1900,15 @@ def run_validation(
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,
                 branch_balance_weight=cfg.branch_balance_weight,
+                condition_assignment_weight=cfg.condition_assignment_weight,
+                initial_action_branch_index=cfg.initial_action_branch_index,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
                 grpo_reward_weight=cfg.grpo_reward_weight,
                 grpo_policy_sigma=cfg.grpo_policy_sigma,
+                grpo_group_size=cfg.grpo_group_size,
+                grpo_clip_epsilon=cfg.grpo_clip_epsilon,
+                grpo_safety_weight=cfg.grpo_safety_weight,
                 grpo_advantage_eps=cfg.grpo_advantage_eps,
                 grpo_advantage_clip=cfg.grpo_advantage_clip,
                 use_proprio=cfg.use_proprio,
@@ -1782,6 +2013,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("branch_assignment_temperature must be > 0")
     if cfg.branch_balance_weight < 0:
         raise ValueError("branch_balance_weight must be >= 0")
+    if cfg.condition_assignment_weight < 0:
+        raise ValueError("condition_assignment_weight must be >= 0")
+    if cfg.initial_action_branch_index < -1 or cfg.initial_action_branch_index >= cfg.num_action_branches:
+        raise ValueError("initial_action_branch_index must be -1 or a valid branch index")
     if cfg.use_cond_action_tokens and not cfg.use_l1_regression:
         raise ValueError("use_cond_action_tokens currently requires use_l1_regression=True")
     if cfg.use_cond_action_tokens and cfg.use_diffusion:
@@ -1815,22 +2050,38 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError(
             "condition_contrastive_weight > 0 requires couple_condition_to_action_branch=True"
         )
+    if cfg.condition_assignment_weight > 0 and (
+        not cfg.use_gaussian_action_head
+        or not cfg.use_best_of_k_action_loss
+        or not cfg.couple_condition_to_action_branch
+    ):
+        raise ValueError(
+            "condition_assignment_weight > 0 requires Gaussian best-of-K with coupled condition-action branches"
+        )
+    if cfg.condition_assignment_weight > 0 and (
+        cfg.condition_alignment_weight <= 0 and cfg.condition_contrastive_weight <= 0
+    ):
+        raise ValueError(
+            "joint condition-action assignment requires a nonzero condition alignment or contrastive weight"
+        )
     if cfg.condition_diversity_weight < 0:
         raise ValueError("condition_diversity_weight must be >= 0")
     if cfg.condition_diversity_margin < 0:
         raise ValueError("condition_diversity_margin must be >= 0")
     if cfg.grpo_reward_weight > 0 and cfg.num_action_branches < 2:
         raise ValueError("grpo_reward_weight > 0 requires num_action_branches >= 2")
-    if cfg.grpo_reward_weight > 0 and cfg.use_best_of_k_action_loss:
+    if cfg.grpo_reward_weight > 0 and not (
+        cfg.use_gaussian_action_head and cfg.use_best_of_k_action_loss
+    ):
         raise ValueError(
-            "The current GRPO loss treats K as whole-trajectory branches and is incompatible "
-            "with per-time best-of-K; set grpo_reward_weight=0 for Stage14"
+            "grpo_reward_weight > 0 requires Gaussian per-time best-of-K action policies"
         )
-    if cfg.grpo_reward_weight > 0 and cfg.use_gaussian_action_head:
-        raise ValueError(
-            "The legacy fixed-sigma GRPO surrogate is disabled for Gaussian policies; "
-            "Stage19 will use sampled actions and exact policy log-probabilities"
-        )
+    if cfg.grpo_group_size < 2:
+        raise ValueError("grpo_group_size must be >= 2")
+    if not 0 < cfg.grpo_clip_epsilon < 1:
+        raise ValueError("grpo_clip_epsilon must lie in (0, 1)")
+    if cfg.grpo_safety_weight < 0:
+        raise ValueError("grpo_safety_weight must be >= 0")
     if cfg.grpo_policy_sigma <= 0:
         raise ValueError("grpo_policy_sigma must be > 0")
     if cfg.grpo_advantage_eps <= 0:
@@ -2098,6 +2349,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 cfg.condition_alignment_weight > 0
                 or cfg.condition_contrastive_weight > 0
                 or cfg.condition_diversity_weight > 0
+                or cfg.condition_assignment_weight > 0
             )
         ),
         num_action_branches=cfg.num_action_branches,
@@ -2289,10 +2541,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_best_of_k_action_loss=cfg.use_best_of_k_action_loss,
                 branch_assignment_temperature=cfg.branch_assignment_temperature,
                 branch_balance_weight=cfg.branch_balance_weight,
+                condition_assignment_weight=cfg.condition_assignment_weight,
+                initial_action_branch_index=cfg.initial_action_branch_index,
                 branch_diversity_weight=cfg.branch_diversity_weight,
                 branch_diversity_margin=cfg.branch_diversity_margin,
                 grpo_reward_weight=cfg.grpo_reward_weight,
                 grpo_policy_sigma=cfg.grpo_policy_sigma,
+                grpo_group_size=cfg.grpo_group_size,
+                grpo_clip_epsilon=cfg.grpo_clip_epsilon,
+                grpo_safety_weight=cfg.grpo_safety_weight,
                 grpo_advantage_eps=cfg.grpo_advantage_eps,
                 grpo_advantage_clip=cfg.grpo_advantage_clip,
                 use_proprio=cfg.use_proprio,

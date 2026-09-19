@@ -458,7 +458,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
+    def _process_vision_features(
+        self,
+        pixel_values,
+        language_embeddings=None,
+        use_film=False,
+        image_role_embeddings=None,
+        image_valid_mask=None,
+    ):
         """Process vision features with optional FiLM conditioning"""
         if use_film:
             # FiLM: Infuse language inputs into visual features
@@ -467,7 +474,33 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
 
         # Project patch embeddings into language embedding space
-        return self.projector(patch_features)
+        projected = self.projector(patch_features)
+        if image_role_embeddings is None and image_valid_mask is None:
+            return projected
+
+        num_images = self.vision_backbone.get_num_images_in_input()
+        patches_per_image = self.vision_backbone.get_num_patches()
+        expected_patches = num_images * patches_per_image
+        if projected.shape[1] != expected_patches:
+            raise ValueError(
+                f"Expected {expected_patches} visual patches for {num_images} images, got {projected.shape[1]}"
+            )
+        projected = projected.reshape(projected.shape[0], num_images, patches_per_image, projected.shape[-1])
+        if image_role_embeddings is not None:
+            if image_role_embeddings.shape != (num_images, projected.shape[-1]):
+                raise ValueError(
+                    "image role embeddings must have shape "
+                    f"({num_images}, {projected.shape[-1]}), got {tuple(image_role_embeddings.shape)}"
+                )
+            projected = projected + image_role_embeddings.to(projected.dtype)[None, :, None, :]
+        if image_valid_mask is not None:
+            if image_valid_mask.shape != (projected.shape[0], num_images):
+                raise ValueError(
+                    f"image_valid_mask must have shape {(projected.shape[0], num_images)}, "
+                    f"got {tuple(image_valid_mask.shape)}"
+                )
+            projected = projected * image_valid_mask.to(projected.dtype)[:, :, None, None]
+        return projected.flatten(1, 2)
 
     # 把机器人自身状态变成一个 token，拼到视觉 token 后面。
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
@@ -483,18 +516,27 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         return projected_patch_embeddings
 
     #这个函数是把视觉 token 插入文本 token 序列。
-    def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
+    def _build_multimodal_attention(
+        self,
+        input_embeddings,
+        projected_patch_embeddings,
+        attention_mask,
+        projected_patch_attention_mask=None,
+    ):
         """Build multimodal embeddings and attention mask"""
         # Update attention mask
-        projected_patch_attention_mask = None
         if attention_mask is not None:
             attention_mask = attention_mask.to(torch.long)
-            projected_patch_attention_mask = torch.full(
-                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                fill_value=1,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+            if projected_patch_attention_mask is None:
+                projected_patch_attention_mask = torch.ones(
+                    (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+            else:
+                projected_patch_attention_mask = projected_patch_attention_mask.to(
+                    device=attention_mask.device, dtype=attention_mask.dtype
+                )
 
         # Build multimodal embeddings & attention mask; insert embeddings after <BOS> token (1:)
         multimodal_embeddings = torch.cat(
@@ -543,6 +585,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        image_valid_mask=None,
+        image_role_embeddings=None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -611,12 +655,38 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            projected_patch_embeddings = self._process_vision_features(
+                pixel_values,
+                language_embeddings,
+                use_film,
+                image_role_embeddings=image_role_embeddings,
+                image_valid_mask=image_valid_mask,
+            )
+            projected_patch_attention_mask = None
+            if image_valid_mask is not None:
+                projected_patch_attention_mask = image_valid_mask.repeat_interleave(
+                    self.vision_backbone.get_num_patches(), dim=1
+                )
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
             )
+            if projected_patch_attention_mask is not None:
+                extra_prefix_tokens = projected_patch_embeddings.shape[1] - projected_patch_attention_mask.shape[1]
+                if extra_prefix_tokens:
+                    projected_patch_attention_mask = torch.cat(
+                        [
+                            projected_patch_attention_mask,
+                            torch.ones(
+                                projected_patch_attention_mask.shape[0],
+                                extra_prefix_tokens,
+                                dtype=projected_patch_attention_mask.dtype,
+                                device=projected_patch_attention_mask.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
 
             # [Diffusion] Add diffusion timestep embedding if provided
             if diffusion_timestep_embeddings is not None:
@@ -624,6 +694,19 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 projected_patch_embeddings = torch.cat(
                     (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
                 )
+                if projected_patch_attention_mask is not None:
+                    projected_patch_attention_mask = torch.cat(
+                        [
+                            projected_patch_attention_mask,
+                            torch.ones(
+                                projected_patch_attention_mask.shape[0],
+                                1,
+                                dtype=projected_patch_attention_mask.dtype,
+                                device=projected_patch_attention_mask.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
 
             # Process action embeddings
             if noisy_actions is not None:
@@ -650,7 +733,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Build multimodal embeddings & attention mask
             multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, attention_mask
+                input_embeddings,
+                projected_patch_embeddings,
+                attention_mask,
+                projected_patch_attention_mask=projected_patch_attention_mask,
             )
 
             # Build labels for multimodal sequence if needed
@@ -805,7 +891,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Unnormalize actions using dataset statistics"""
         action_norm_stats = self.get_action_stats(unnorm_key)
 
-        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+        if "normalization_low" in action_norm_stats and "normalization_high" in action_norm_stats:
+            action_low = np.array(action_norm_stats["normalization_low"])
+            action_high = np.array(action_norm_stats["normalization_high"])
+            mask = action_norm_stats.get("mask", np.ones_like(action_low, dtype=bool))
+        elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
             mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
             action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:

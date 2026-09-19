@@ -27,6 +27,9 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, GaussianActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.models.uav_condition_adapter import IndoorUAVConditionAdapter
+from prismatic.models.uav_progress_stop_head import IndoorUAVProgressStopHead
+from prismatic.models.uav_stop_head import IndoorUAVStopHead
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -455,6 +458,36 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
     return proprio_projector
 
 
+def get_indoor_uav_condition_adapter(cfg: Any, llm_dim: int) -> IndoorUAVConditionAdapter:
+    """Load the learned image-role and condition/vision matching adapter."""
+    adapter = IndoorUAVConditionAdapter(
+        llm_dim=llm_dim,
+        hidden_dim=getattr(cfg, "condition_match_hidden_dim", 1024),
+        match_dim=getattr(cfg, "condition_match_dim", 512),
+    ).to(DEVICE)
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "condition_adapter")
+    adapter.load_state_dict(load_component_state_dict(checkpoint_path))
+    return adapter.eval()
+
+
+def get_indoor_uav_stop_head(cfg: Any, llm_dim: int) -> torch.nn.Module:
+    """Load the classifier that terminates after executing a root action."""
+    if getattr(cfg, "use_indoor_uav_progress_stop_head", False):
+        stop_head = IndoorUAVProgressStopHead(
+            input_dim=llm_dim,
+            projection_dim=getattr(cfg, "stop_progress_projection_dim", 512),
+            hidden_dim=getattr(cfg, "stop_head_hidden_dim", 1024),
+        ).to(DEVICE)
+    else:
+        stop_head = IndoorUAVStopHead(
+            input_dim=llm_dim,
+            hidden_dim=getattr(cfg, "stop_head_hidden_dim", 1024),
+        ).to(DEVICE)
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "stop_head")
+    stop_head.load_state_dict(load_component_state_dict(checkpoint_path))
+    return stop_head.eval()
+
+
 def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     """
     Get noisy action projector for diffusion-based action prediction.
@@ -696,7 +729,11 @@ def normalize_proprio(proprio: np.ndarray, norm_stats: Dict[str, Any]) -> np.nda
     Returns:
         np.ndarray: Normalized proprioception data
     """
-    if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+    if "normalization_low" in norm_stats and "normalization_high" in norm_stats:
+        proprio_low = np.array(norm_stats["normalization_low"])
+        proprio_high = np.array(norm_stats["normalization_high"])
+        mask = norm_stats.get("mask", np.ones_like(proprio_low, dtype=bool))
+    elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
         mask = norm_stats.get("mask", np.ones_like(norm_stats["min"], dtype=bool))
         proprio_high, proprio_low = np.array(norm_stats["max"]), np.array(norm_stats["min"])
     elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:

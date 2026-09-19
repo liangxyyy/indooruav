@@ -66,7 +66,10 @@ def normalize_action_and_proprio(traj: Dict, metadata: Dict, normalization_type:
 
     elif normalization_type in [NormalizationType.BOUNDS, NormalizationType.BOUNDS_Q99]:
         for key, traj_key in keys_to_normalize.items():
-            if normalization_type == NormalizationType.BOUNDS:
+            if "normalization_low" in metadata[key] and "normalization_high" in metadata[key]:
+                low = metadata[key]["normalization_low"]
+                high = metadata[key]["normalization_high"]
+            elif normalization_type == NormalizationType.BOUNDS:
                 low = metadata[key]["min"]
                 high = metadata[key]["max"]
             elif normalization_type == NormalizationType.BOUNDS_Q99:

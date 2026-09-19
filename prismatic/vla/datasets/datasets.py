@@ -9,7 +9,7 @@ format to OpenVLA, IterableDataset shim.
 # 其他无人机原始数据集，可以写RLDS转换器
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import numpy as np
 import torch
@@ -53,6 +53,8 @@ class RLDSBatchTransform:
     use_cond_action_tokens: bool = False
     load_future_images: bool = False
     num_action_branches: int = 1
+    use_reference_previous_current: bool = False
+    body_delta_action_targets: bool = False
 
     def _build_cond_action_string(self) -> str:
         tokens = []
@@ -65,7 +67,21 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name = rlds_batch["dataset_name"]
         current_obs_index = self.num_images_in_input - 1 if self.use_image_history else 0
-        if self.use_image_history:
+        if self.use_reference_previous_current:
+            if self.num_images_in_input != 3:
+                raise ValueError("reference/previous/current input requires num_images_in_input=3")
+            history_mask = rlds_batch["observation"].get("pad_mask")
+            if history_mask is None or len(history_mask) != 2:
+                raise ValueError("reference/previous/current input requires a two-frame primary history window")
+            reference = rlds_batch["observation"]["image_secondary"][1]
+            previous, current = rlds_batch["observation"]["image_primary"][:2]
+            pixel_values = torch.cat(
+                [self.image_transform(Image.fromarray(image)) for image in (reference, previous, current)],
+                dim=0,
+            )
+            image_valid_mask = np.asarray([True, bool(history_mask[0]), True], dtype=np.bool_)
+            current_obs_index = 1
+        elif self.use_image_history:
             pad_mask = rlds_batch["observation"].get("pad_mask")
             if self.require_full_image_history and (pad_mask is None or not np.all(pad_mask)):
                 return None
@@ -77,8 +93,13 @@ class RLDSBatchTransform:
         else:
             img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
             pixel_values = self.image_transform(img)
+            image_valid_mask = None
 
-        action_chunk = rlds_batch["action"][current_obs_index:]
+        action_chunk = (
+            rlds_batch["action"]
+            if self.body_delta_action_targets
+            else rlds_batch["action"][current_obs_index:]
+        )
         current_action = action_chunk[0]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = action_chunk
@@ -122,7 +143,23 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=actions,
+        )
+        if "episode_id" in rlds_batch:
+            return_dict["episode_id"] = rlds_batch["episode_id"]
+        if "stop_after_action" in rlds_batch:
+            return_dict["stop_after_action"] = np.asarray(
+                rlds_batch["stop_after_action"], dtype=np.float32
+            )
+        if "actions_remaining_after_root" in rlds_batch:
+            return_dict["actions_remaining_after_root"] = np.asarray(
+                rlds_batch["actions_remaining_after_root"], dtype=np.int64
+            )
 
         # Add additional inputs
         if self.use_wrist_image:
@@ -136,10 +173,16 @@ class RLDSBatchTransform:
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"][current_obs_index]
             return_dict["proprio"] = proprio
-        if self.use_image_history:
+        if self.use_reference_previous_current:
+            return_dict["image_valid_mask"] = image_valid_mask
+        elif self.use_image_history:
             return_dict["image_history_pad_mask"] = rlds_batch["observation"].get("pad_mask")
+        if "plan_valid_mask" in rlds_batch:
+            return_dict["plan_valid_mask"] = rlds_batch["plan_valid_mask"][:NUM_ACTIONS_CHUNK]
         if self.load_future_images and "future_observation" in rlds_batch:
-            future_images = rlds_batch["future_observation"]["image_primary"][:NUM_ACTIONS_CHUNK]
+            # Slot 0 has no visual-condition loss; only I_(t+1)..I_(t+T-1)
+            # are image labels for the future COND tokens.
+            future_images = rlds_batch["future_observation"]["image_primary"][1:NUM_ACTIONS_CHUNK]
             return_dict["future_pixel_values"] = torch.stack(
                 [self.image_transform(Image.fromarray(image)) for image in future_images],
                 dim=0,
@@ -157,11 +200,15 @@ class RLDSDataset(IterableDataset):
         resize_resolution: Tuple[int, int],
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
+        tfds_split: Optional[str] = None,
         image_aug: bool = False,
         window_size: int = 1,
         relative_action_targets: bool = False,
         future_action_stride: int = 1,
         relative_action_wrap_yaw: bool = False,
+        body_delta_action_targets: bool = False,
+        cyclic_yaw_proprio: bool = False,
+        use_reference_previous_current: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -175,7 +222,9 @@ class RLDSDataset(IterableDataset):
             mixture_spec = [(self.data_mix, 1.0)]
 
         # fmt: off
-        if "aloha" in self.data_mix:
+        if use_reference_previous_current:
+            load_camera_views = ("primary", "secondary")
+        elif "aloha" in self.data_mix:
             load_camera_views = ("primary", "left_wrist", "right_wrist")
         else:
             load_camera_views = ("primary", "wrist")
@@ -192,10 +241,13 @@ class RLDSDataset(IterableDataset):
         for dataset_kwargs in per_dataset_kwargs:
             dataset_kwargs.update(
                 {
+                    "tfds_split": tfds_split,
                     "relative_action_targets": relative_action_targets,
                     "relative_action_horizon": NUM_ACTIONS_CHUNK,
                     "relative_action_stride": future_action_stride,
                     "relative_action_wrap_yaw": relative_action_wrap_yaw,
+                    "body_delta_action_targets": body_delta_action_targets,
+                    "cyclic_yaw_proprio": cyclic_yaw_proprio,
                 }
             )
         rlds_config = dict(
@@ -205,6 +257,9 @@ class RLDSDataset(IterableDataset):
                 future_action_stride=future_action_stride,          # Raw-step spacing between future targets
                 relative_action_targets=relative_action_targets,    # Cumulative offsets from current UAV state
                 relative_action_wrap_yaw=relative_action_wrap_yaw,  # Match PAI-0 when False
+                body_delta_action_targets=body_delta_action_targets,
+                cyclic_yaw_proprio=cyclic_yaw_proprio,
+                pad_future_horizon=body_delta_action_targets,
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
             ),

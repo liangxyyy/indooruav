@@ -4,9 +4,12 @@ finetune.py
 Fine-tunes OpenVLA via LoRA.
 """
 
+import hashlib
+import json
 import math
 import os
 import random
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -32,6 +35,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
 
+STOP_PROGRESS_HORIZONS = (0, 1, 2, 4)
+
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
@@ -44,6 +49,9 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, GaussianActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
+from prismatic.models.uav_condition_adapter import IndoorUAVConditionAdapter
+from prismatic.models.uav_progress_stop_head import IndoorUAVProgressStopHead
+from prismatic.models.uav_stop_head import IndoorUAVStopHead
 from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
@@ -57,10 +65,13 @@ from prismatic.training.train_utils import (
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.condition_matching import (
+    CrossEpisodeImageQueue,
     center_condition_branches,
     center_visual_patches,
     condition_branch_contrastive_loss,
     condition_to_patch_similarity,
+    condition_to_image_logits,
+    projected_condition_to_patch_similarity,
 )
 from prismatic.vla.constants import (
     ACTION_DIM,
@@ -147,6 +158,99 @@ def _get_action_norm_stats(dataset_statistics: dict, dataset_name: str) -> Optio
     if len(dataset_statistics) == 1:
         return next(iter(dataset_statistics.values())).get("action")
     return None
+
+
+def _get_proprio_norm_stats(dataset_statistics: dict, dataset_name: str) -> Optional[dict]:
+    if not dataset_statistics:
+        return None
+    if dataset_name in dataset_statistics:
+        return dataset_statistics[dataset_name].get("proprio")
+    if len(dataset_statistics) == 1:
+        return next(iter(dataset_statistics.values())).get("proprio")
+    return None
+
+
+def get_model_proprio_dim(cfg) -> int:
+    return 5 if cfg.cyclic_yaw_proprio else PROPRIO_DIM
+
+
+def save_policy_contract(cfg, dataset_statistics: dict, output_dir: Path) -> None:
+    """Persist the data/model/execution contract required by Stage20 inference."""
+    if not cfg.use_indoor_uav_condition_adapter:
+        return
+    action_stats = _get_action_norm_stats(dataset_statistics, cfg.dataset_name)
+    proprio_stats = _get_proprio_norm_stats(dataset_statistics, cfg.dataset_name)
+    normalization_values = np.concatenate(
+        [
+            np.asarray(stats[key], dtype=np.float32).reshape(-1)
+            for stats in (action_stats, proprio_stats)
+            for key in ("normalization_low", "normalization_high")
+        ]
+    )
+    contract = {
+        "schema_version": (
+            4 if cfg.use_indoor_uav_progress_stop_head else (3 if cfg.use_indoor_uav_stop_head else 2)
+        ),
+        "training_objective": "sft",
+        "initial_vla_path": cfg.vla_path,
+        "uav_modules_initialized_fresh": not cfg.resume and cfg.auxiliary_init_checkpoint_path is None,
+        "input_roles": ["reference", "previous", "current"],
+        "image_valid_mask": "1 means the image and all of its patches may attend",
+        "horizon": NUM_ACTIONS_CHUNK,
+        "num_action_branches": cfg.num_action_branches,
+        "action_dim": ACTION_DIM,
+        "source_proprio_dim": PROPRIO_DIM,
+        "model_proprio_dim": get_model_proprio_dim(cfg),
+        "proprio_representation": "xyz_sin_yaw_cos_yaw_v1",
+        "condition_match_dim": cfg.condition_match_dim,
+        "condition_patch_topk": cfg.condition_patch_topk,
+        "condition_branch_assignment": "action_error_only",
+        "condition_objective": "per_time_k_way_plus_temporal_plus_cross_episode_queue",
+        "condition_branch_weight": cfg.condition_contrastive_weight,
+        "condition_temporal_weight": cfg.condition_temporal_weight,
+        "condition_queue_weight": cfg.condition_queue_weight,
+        "condition_queue_size": cfg.condition_queue_size,
+        "condition_queue_min_negatives": cfg.condition_queue_min_negatives,
+        "condition_alignment": "slot j condition is image I_(t+j), j>=1",
+        "action_alignment": "slot j action maps pose p_(t+j) to p_(t+j+1)",
+        "action_representation": "body_delta_one_step_v1",
+        "action_axes": ["forward", "right", "up", "yaw"],
+        "yaw_zero_forward_world": [0.0, -1.0, 0.0],
+        "yaw_zero_right_world": [1.0, 0.0, 0.0],
+        "positive_yaw_turn": "right",
+        "negative_yaw_turn": "left",
+        "yaw_unit": "radian",
+        "yaw_delta_formula": "((yaw_next-yaw_current+pi) mod (2*pi))-pi",
+        "yaw_delta_range": "[-pi, pi)",
+        "future_action_stride": cfg.future_action_stride,
+        "action_normalization": "per_axis_symmetric_minmax_v1",
+        "proprio_normalization": "xyz_q01_q99_and_sincos_unit_bounds_v1",
+        "normalization_sha256": hashlib.sha256(normalization_values.tobytes()).hexdigest(),
+        "condition_threshold": None,
+        "stop_after_action": cfg.use_indoor_uav_stop_head,
+        "stop_target_semantics": (
+            "execute root action, then terminate instruction"
+            if cfg.use_indoor_uav_stop_head
+            else None
+        ),
+        "stop_loss_weight": cfg.stop_loss_weight,
+        "stop_positive_weight": cfg.stop_positive_weight,
+        "stop_threshold": cfg.stop_threshold,
+        "stop_head_type": (
+            "act_cond_ordinal_progress_v1"
+            if cfg.use_indoor_uav_progress_stop_head
+            else ("root_act_binary_v1" if cfg.use_indoor_uav_stop_head else None)
+        ),
+        "stop_progress_horizons": (
+            list(STOP_PROGRESS_HORIZONS) if cfg.use_indoor_uav_progress_stop_head else None
+        ),
+        "stop_progress_loss_weight": cfg.stop_progress_loss_weight,
+        "stop_progress_positive_weights": getattr(cfg, "stop_progress_positive_weights", None),
+        "launch_argv": sys.argv,
+    }
+    output_path = Path(output_dir) / "policy_contract.json"
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(contract, handle, indent=2, ensure_ascii=False)
 
 
 def _stats_tensor(values, device, dtype=torch.float32) -> torch.Tensor:
@@ -252,6 +356,502 @@ def compute_best_of_k_action_loss(
         metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
 
     return best_of_k_loss, branch_balance_loss, winner_indices, metrics
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(device=values.device, dtype=values.dtype)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def _valid_future_episode_ids(episode_ids, future_mask: torch.Tensor) -> list[str]:
+    """Expand one episode id per batch item to valid future-image labels."""
+    if episode_ids is None or len(episode_ids) != future_mask.shape[0]:
+        raise ValueError("cross-episode matching requires one episode_id per batch item")
+    valid = future_mask.detach().cpu().tolist()
+    output = []
+    for episode_id, row_mask in zip(episode_ids, valid):
+        if isinstance(episode_id, bytes):
+            episode_id = episode_id.decode("utf-8")
+        output.extend([str(episode_id)] * sum(row_mask))
+    return output
+
+
+def compute_cross_episode_queue_loss(
+    conditions: torch.Tensor,
+    positive_images: torch.Tensor,
+    query_episode_ids: list[str],
+    queued_images: Optional[torch.Tensor],
+    queued_episode_ids: list[str],
+    *,
+    temperature: float,
+    patch_topk: int,
+    min_negatives: int,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Contrast each condition with detached images from other episodes only."""
+    zero = conditions.sum() * 0.0
+    empty_metrics = {
+        "condition_queue_loss": 0.0,
+        "condition_queue_accuracy": 0.0,
+        "condition_queue_random_accuracy": 0.0,
+        "condition_queue_margin": 0.0,
+        "condition_queue_queries": 0.0,
+        "condition_queue_negatives": 0.0,
+    }
+    if queued_images is None or conditions.shape[0] == 0:
+        return zero, empty_metrics
+    if len(query_episode_ids) != conditions.shape[0]:
+        raise ValueError("one query episode id is required per condition")
+    if len(queued_episode_ids) != queued_images.shape[0]:
+        raise ValueError("queued episode ids and images must have equal length")
+    if min_negatives < 1:
+        raise ValueError("condition_queue_min_negatives must be >= 1")
+
+    losses, accuracies, random_accuracies, margins, negative_counts = [], [], [], [], []
+    for episode_id in dict.fromkeys(query_episode_ids):
+        query_indices = [idx for idx, query_id in enumerate(query_episode_ids) if query_id == episode_id]
+        eligible = [idx for idx, queued_id in enumerate(queued_episode_ids) if queued_id != episode_id]
+        if len(eligible) < min_negatives:
+            continue
+        query_conditions = conditions[query_indices]
+        positive_scores = condition_to_image_logits(
+            query_conditions, positive_images[query_indices], patch_topk
+        ).diagonal()
+        negative_scores = condition_to_image_logits(
+            query_conditions, queued_images[eligible], patch_topk
+        )
+        logits = torch.cat([positive_scores[:, None], negative_scores], dim=1) / temperature
+        labels = logits.new_zeros(logits.shape[0], dtype=torch.long)
+        losses.append(torch.nn.functional.cross_entropy(logits, labels, reduction="none"))
+        accuracies.append((logits.argmax(dim=1) == 0).float())
+        random_accuracies.extend([1.0 / logits.shape[1]] * len(query_indices))
+        margins.append(positive_scores - negative_scores.max(dim=1).values)
+        negative_counts.extend([float(len(eligible))] * len(query_indices))
+
+    if not losses:
+        return zero, empty_metrics
+    losses = torch.cat(losses)
+    accuracies = torch.cat(accuracies)
+    margins = torch.cat(margins)
+    loss = losses.mean()
+    return loss, {
+        "condition_queue_loss": loss.item(),
+        "condition_queue_accuracy": accuracies.mean().item(),
+        "condition_queue_random_accuracy": sum(random_accuracies) / len(random_accuracies),
+        "condition_queue_margin": margins.mean().item(),
+        "condition_queue_queries": float(losses.shape[0]),
+        "condition_queue_negatives": sum(negative_counts) / len(negative_counts),
+    }
+
+
+def compute_masked_single_branch_sft_loss(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    plan_valid_mask: torch.Tensor,
+    *,
+    root_action_weight: float,
+    future_action_weight: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Stage20 K=1 action baseline with the same masking and loss geometry as Best-of-K SFT."""
+    if predicted_actions.ndim == 4:
+        if predicted_actions.shape[2] != 1:
+            raise ValueError("single-branch SFT expects exactly one action branch")
+        predicted_actions = predicted_actions.squeeze(2)
+    if predicted_actions.shape != ground_truth_actions.shape:
+        raise ValueError("single-branch predictions and targets must have shape (B,T,D)")
+    if plan_valid_mask.shape != ground_truth_actions.shape[:2]:
+        raise ValueError("plan_valid_mask must have shape (B,T)")
+
+    action_errors = torch.nn.functional.smooth_l1_loss(
+        predicted_actions.float(), ground_truth_actions.float(), reduction="none"
+    ).mean(dim=-1)
+    root_loss = _masked_mean(action_errors[:, 0], plan_valid_mask[:, 0])
+    future_loss = _masked_mean(action_errors[:, 1:], plan_valid_mask[:, 1:])
+    loss = root_action_weight * root_loss + future_action_weight * future_loss
+    return loss, {
+        "sft_root_action_loss": root_loss.item(),
+        "sft_future_action_loss": future_loss.item(),
+        "root_valid_count": plan_valid_mask[:, 0].sum().item(),
+        "future_valid_count": plan_valid_mask[:, 1:].sum().item(),
+        "plan_valid_ratio": plan_valid_mask.float().mean().item(),
+    }
+
+
+def compute_stop_after_action_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    positive_weight: float,
+    threshold: float = 0.5,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Balanced BCE for the post-root-action terminal decision."""
+    logits = logits.float().reshape(-1)
+    targets = targets.float().reshape(-1)
+    if logits.shape != targets.shape:
+        raise ValueError("stop logits and targets must have the same shape")
+    if positive_weight <= 0:
+        raise ValueError("positive_weight must be > 0")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError("threshold must lie in (0,1)")
+
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        pos_weight=logits.new_tensor(positive_weight),
+    )
+    probabilities = torch.sigmoid(logits.detach())
+    predicted = probabilities >= threshold
+    positive = targets.bool()
+    negative = ~positive
+    return loss, {
+        "stop_loss": loss.item(),
+        "stop_probability_mean": probabilities.mean().item(),
+        "stop_target_rate": targets.mean().item(),
+        "stop_predicted_rate": predicted.float().mean().item(),
+        "stop_true_positive": float((predicted & positive).sum().item()),
+        "stop_true_negative": float(((~predicted) & negative).sum().item()),
+        "stop_false_positive": float((predicted & negative).sum().item()),
+        "stop_false_negative": float(((~predicted) & positive).sum().item()),
+        "stop_sample_count": float(targets.numel()),
+        "stop_positive_count": float(positive.sum().item()),
+        "stop_negative_count": float(negative.sum().item()),
+        # Validation consumes and removes these private fields before scalar
+        # aggregation.  Keeping the individual scores is necessary for exact
+        # threshold calibration and ROC-AUC rather than guessing from a mean.
+        "_stop_probabilities": probabilities.cpu().tolist(),
+        "_stop_targets": targets.detach().cpu().tolist(),
+    }
+
+
+def compute_binary_score_diagnostics(probabilities, targets) -> Dict[str, float]:
+    """Exact binary ranking and best-balanced-threshold diagnostics."""
+    probabilities = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    if probabilities.shape != targets.shape or probabilities.size == 0:
+        raise ValueError("probabilities and targets must be equally sized non-empty arrays")
+    if not np.isin(targets, [0, 1]).all():
+        raise ValueError("binary targets must contain only 0 and 1")
+    positives = probabilities[targets == 1]
+    negatives = probabilities[targets == 0]
+    if positives.size == 0 or negatives.size == 0:
+        raise ValueError("binary score diagnostics require both positive and negative samples")
+
+    comparisons = positives[:, None] - negatives[None, :]
+    roc_auc = float((comparisons > 0).mean() + 0.5 * (comparisons == 0).mean())
+
+    best = None
+    for threshold in np.unique(probabilities):
+        predicted = probabilities >= threshold
+        tp = int(np.logical_and(predicted, targets == 1).sum())
+        tn = int(np.logical_and(~predicted, targets == 0).sum())
+        fp = int(np.logical_and(predicted, targets == 0).sum())
+        fn = int(np.logical_and(~predicted, targets == 1).sum())
+        recall = tp / positives.size
+        specificity = tn / negatives.size
+        balanced_accuracy = 0.5 * (recall + specificity)
+        # Prefer fewer false positives when balanced accuracy ties.
+        candidate = (balanced_accuracy, specificity, float(threshold), tp, tn, fp, fn)
+        if best is None or candidate[:3] > best[:3]:
+            best = candidate
+
+    balanced_accuracy, specificity, threshold, tp, tn, fp, fn = best
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / positives.size
+    return {
+        "stop_roc_auc": roc_auc,
+        "stop_positive_probability_mean": float(positives.mean()),
+        "stop_positive_probability_min": float(positives.min()),
+        "stop_positive_probability_max": float(positives.max()),
+        "stop_negative_probability_mean": float(negatives.mean()),
+        "stop_negative_probability_min": float(negatives.min()),
+        "stop_negative_probability_max": float(negatives.max()),
+        "stop_probability_class_gap": float(positives.mean() - negatives.mean()),
+        "stop_best_threshold": threshold,
+        "stop_best_balanced_accuracy": float(balanced_accuracy),
+        "stop_best_precision": float(precision),
+        "stop_best_recall": float(recall),
+        "stop_best_specificity": float(specificity),
+        "stop_best_true_positive": float(tp),
+        "stop_best_true_negative": float(tn),
+        "stop_best_false_positive": float(fp),
+        "stop_best_false_negative": float(fn),
+    }
+
+
+def compute_progress_stop_loss(
+    logits: torch.Tensor,
+    actions_remaining_after_root: torch.Tensor,
+    positive_weights,
+    auxiliary_weight: float,
+    threshold: float = 0.5,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Terminal BCE plus dense ordinal supervision for remaining trajectory steps."""
+    if logits.ndim != 2 or logits.shape[1] != len(STOP_PROGRESS_HORIZONS):
+        raise ValueError("progress STOP logits must have shape (B,4)")
+    if auxiliary_weight < 0:
+        raise ValueError("auxiliary_weight must be non-negative")
+    weights = torch.as_tensor(positive_weights, device=logits.device, dtype=torch.float32)
+    if weights.shape != (len(STOP_PROGRESS_HORIZONS),) or (weights <= 0).any():
+        raise ValueError("positive_weights must provide four positive values")
+
+    remaining = actions_remaining_after_root.to(logits.device).long().reshape(-1)
+    horizons = torch.as_tensor(STOP_PROGRESS_HORIZONS, device=logits.device)
+    targets = (remaining[:, None] <= horizons[None, :]).float()
+    terminal_loss, metrics = compute_stop_after_action_loss(
+        logits[:, 0], targets[:, 0], float(weights[0]), threshold=threshold
+    )
+    auxiliary_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits[:, 1:].float(),
+        targets[:, 1:],
+        pos_weight=weights[1:],
+        reduction="none",
+    ).mean(dim=0)
+    auxiliary_loss = auxiliary_losses.mean()
+    total_loss = terminal_loss + auxiliary_weight * auxiliary_loss
+    metrics.update(
+        {
+            "stop_progress_aux_loss": auxiliary_loss.item(),
+            "stop_progress_total_loss": total_loss.item(),
+        }
+    )
+    probabilities = torch.sigmoid(logits.detach().float())
+    for index, horizon in enumerate(STOP_PROGRESS_HORIZONS):
+        metrics[f"stop_progress_h{horizon}_probability_mean"] = probabilities[:, index].mean().item()
+        metrics[f"stop_progress_h{horizon}_target_rate"] = targets[:, index].mean().item()
+        metrics[f"stop_progress_h{horizon}_accuracy"] = (
+            (probabilities[:, index] >= threshold) == targets[:, index].bool()
+        ).float().mean().item()
+        if index > 0:
+            metrics[f"stop_progress_h{horizon}_loss"] = auxiliary_losses[index - 1].item()
+    return total_loss, metrics
+
+
+def compute_indoor_uav_sft_loss(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    projected_conditions: torch.Tensor,
+    future_patch_embeddings: torch.Tensor,
+    condition_similarities: torch.Tensor,
+    plan_valid_mask: torch.Tensor,
+    *,
+    assignment_temperature: float,
+    root_action_weight: float,
+    future_action_weight: float,
+    condition_alignment_weight: float,
+    condition_contrastive_weight: float,
+    condition_temporal_weight: float,
+    condition_queue_weight: float,
+    condition_contrastive_temperature: float,
+    branch_balance_weight: float,
+    condition_diversity_weight: float,
+    condition_diversity_margin: float,
+    patch_topk: int,
+    query_episode_ids=None,
+    queued_image_patches: Optional[torch.Tensor] = None,
+    queued_episode_ids: Optional[list[str]] = None,
+    condition_queue_min_negatives: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Masked deterministic Best-of-K SFT for the IndoorUAV condition-action policy."""
+    if predicted_actions.ndim != 4 or ground_truth_actions.ndim != 3:
+        raise ValueError("actions must have shapes (B,T,K,D) and (B,T,D)")
+    if predicted_actions.shape[:2] != ground_truth_actions.shape[:2]:
+        raise ValueError("predicted and target action batch/time dimensions must match")
+    if plan_valid_mask.shape != ground_truth_actions.shape[:2]:
+        raise ValueError("plan_valid_mask must have shape (B,T)")
+
+    action_errors = torch.nn.functional.smooth_l1_loss(
+        predicted_actions.float(),
+        ground_truth_actions[:, :, None, :].float().expand_as(predicted_actions),
+        reduction="none",
+    ).mean(dim=-1)
+    root_loss = _masked_mean(action_errors[:, 0, 0], plan_valid_mask[:, 0])
+
+    future_errors = action_errors[:, 1:]
+    future_mask = plan_valid_mask[:, 1:].bool()
+    # The expert action, not the condition's own similarity score, assigns the
+    # paired branch. Otherwise the K-way label is self-generated by the logits
+    # it is supposed to supervise and retrieval accuracy becomes circular.
+    winners = future_errors.detach().argmin(dim=-1)
+    winner_errors = future_errors.gather(2, winners.unsqueeze(-1)).squeeze(-1)
+    future_action_loss = _masked_mean(winner_errors, future_mask)
+
+    # Diagnostics for deciding whether K represents distinct, stable action
+    # hypotheses rather than nearly identical branches with arbitrary winners.
+    if predicted_actions.shape[2] > 1:
+        sorted_action_errors = future_errors.detach().sort(dim=-1).values
+        winner_action_gap = sorted_action_errors[..., 1] - sorted_action_errors[..., 0]
+        action_pair_distances = []
+        for left in range(predicted_actions.shape[2]):
+            for right in range(left + 1, predicted_actions.shape[2]):
+                action_pair_distances.append(
+                    torch.abs(
+                        predicted_actions[:, 1:, left].float()
+                        - predicted_actions[:, 1:, right].float()
+                    ).mean(dim=-1)
+                )
+        action_pair_distances = torch.stack(action_pair_distances, dim=-1)
+        action_branch_pair_l1 = _masked_mean(action_pair_distances.mean(dim=-1), future_mask)
+        action_branch_min_pair_l1 = _masked_mean(action_pair_distances.min(dim=-1).values, future_mask)
+        action_winner_gap = _masked_mean(winner_action_gap, future_mask)
+        action_winner_near_tie_rate = _masked_mean(
+            (winner_action_gap < 1e-3).float(), future_mask
+        )
+    else:
+        action_branch_pair_l1 = predicted_actions.sum() * 0.0
+        action_branch_min_pair_l1 = predicted_actions.sum() * 0.0
+        action_winner_gap = predicted_actions.sum() * 0.0
+        action_winner_near_tie_rate = predicted_actions.sum() * 0.0
+
+    winner_similarities = condition_similarities.gather(2, winners.unsqueeze(-1)).squeeze(-1)
+    positive_loss = _masked_mean(1.0 - winner_similarities, future_mask)
+
+    selected_conditions = projected_conditions.gather(
+        2,
+        winners[..., None, None].expand(-1, -1, 1, projected_conditions.shape[-1]),
+    ).squeeze(2)
+    valid_conditions = selected_conditions[future_mask]
+    valid_images = future_patch_embeddings[future_mask]
+    if condition_similarities.shape[2] > 1:
+        branch_loss, branch_accuracy, branch_margin = condition_branch_contrastive_loss(
+            condition_similarities,
+            winners,
+            temperature=condition_contrastive_temperature,
+            loss_start_time_index=0,
+            valid_mask=future_mask,
+        )
+    else:
+        branch_loss = predicted_actions.sum() * 0.0
+        branch_accuracy = branch_loss.detach()
+        branch_margin = branch_loss.detach()
+
+    if valid_conditions.shape[0] > 1:
+        retrieval_scores = condition_to_image_logits(valid_conditions, valid_images, patch_topk)
+        retrieval_logits = retrieval_scores / condition_contrastive_temperature
+        retrieval_labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
+        temporal_loss = torch.nn.functional.cross_entropy(retrieval_logits, retrieval_labels)
+        retrieval_accuracy = (retrieval_logits.argmax(dim=1) == retrieval_labels).float().mean()
+        positive_scores = retrieval_scores.diagonal()
+        negative_mask = ~torch.eye(
+            retrieval_scores.shape[0], dtype=torch.bool, device=retrieval_scores.device
+        )
+        hardest_negative_scores = retrieval_scores.masked_fill(negative_mask.logical_not(), -torch.inf).max(dim=1).values
+        retrieval_positive = positive_scores.mean()
+        retrieval_hardest_negative = hardest_negative_scores.mean()
+        retrieval_margin = (positive_scores - hardest_negative_scores).mean()
+    else:
+        temporal_loss = predicted_actions.sum() * 0.0
+        retrieval_accuracy = predicted_actions.new_zeros((), dtype=torch.float32)
+        retrieval_positive = predicted_actions.new_zeros((), dtype=torch.float32)
+        retrieval_hardest_negative = predicted_actions.new_zeros((), dtype=torch.float32)
+        retrieval_margin = predicted_actions.new_zeros((), dtype=torch.float32)
+
+    if condition_queue_weight > 0:
+        valid_episode_ids = _valid_future_episode_ids(query_episode_ids, future_mask)
+        queue_loss, queue_metrics = compute_cross_episode_queue_loss(
+            valid_conditions,
+            valid_images,
+            valid_episode_ids,
+            queued_image_patches,
+            queued_episode_ids or [],
+            temperature=condition_contrastive_temperature,
+            patch_topk=patch_topk,
+            min_negatives=condition_queue_min_negatives,
+        )
+    else:
+        queue_loss = predicted_actions.sum() * 0.0
+        queue_metrics = {
+            "condition_queue_loss": 0.0,
+            "condition_queue_accuracy": 0.0,
+            "condition_queue_random_accuracy": 0.0,
+            "condition_queue_margin": 0.0,
+            "condition_queue_queries": 0.0,
+            "condition_queue_negatives": 0.0,
+        }
+
+    soft_assignments = torch.softmax(-future_errors / assignment_temperature, dim=-1)
+    valid_soft_assignments = soft_assignments[future_mask]
+    if valid_soft_assignments.numel():
+        branch_usage = valid_soft_assignments.mean(dim=0)
+        uniform = torch.full_like(branch_usage, 1.0 / predicted_actions.shape[2])
+        balance_loss = torch.sum(branch_usage * torch.log((branch_usage + 1e-8) / uniform))
+    else:
+        branch_usage = torch.full(
+            (predicted_actions.shape[2],),
+            1.0 / predicted_actions.shape[2],
+            device=predicted_actions.device,
+        )
+        balance_loss = predicted_actions.new_zeros((), dtype=torch.float32)
+
+    pair_distances = []
+    for left in range(projected_conditions.shape[2]):
+        for right in range(left + 1, projected_conditions.shape[2]):
+            cosine = (projected_conditions[:, :, left] * projected_conditions[:, :, right]).sum(dim=-1)
+            pair_distances.append(1.0 - cosine)
+    if pair_distances:
+        pair_distances = torch.stack(pair_distances, dim=-1)
+        diversity_loss = _masked_mean(
+            torch.relu(condition_diversity_margin - pair_distances).mean(dim=-1),
+            future_mask,
+        )
+    else:
+        diversity_loss = predicted_actions.new_zeros((), dtype=torch.float32)
+
+    loss = (
+        root_action_weight * root_loss
+        + future_action_weight * future_action_loss
+        + condition_alignment_weight * positive_loss
+        + condition_contrastive_weight * branch_loss
+        + condition_temporal_weight * temporal_loss
+        + condition_queue_weight * queue_loss
+        + branch_balance_weight * balance_loss
+        + condition_diversity_weight * diversity_loss
+    )
+    metrics = {
+        "sft_root_action_loss": root_loss.item(),
+        "sft_future_action_loss": future_action_loss.item(),
+        "action_branch_pair_l1": action_branch_pair_l1.item(),
+        "action_branch_min_pair_l1": action_branch_min_pair_l1.item(),
+        "action_winner_gap": action_winner_gap.item(),
+        "action_winner_near_tie_rate": action_winner_near_tie_rate.item(),
+        "condition_alignment_loss": positive_loss.item(),
+        "condition_contrastive_loss": branch_loss.item(),
+        "condition_branch_accuracy": branch_accuracy.item(),
+        "condition_branch_random_accuracy": (
+            1.0 / condition_similarities.shape[2] if future_mask.any() else 0.0
+        ),
+        "condition_branch_margin": branch_margin.item(),
+        "condition_temporal_loss": temporal_loss.item(),
+        "condition_retrieval_accuracy": retrieval_accuracy.item(),
+        "condition_temporal_random_accuracy": (
+            1.0 / valid_conditions.shape[0] if valid_conditions.shape[0] > 1 else 0.0
+        ),
+        "condition_retrieval_positive": retrieval_positive.item(),
+        "condition_retrieval_hardest_negative": retrieval_hardest_negative.item(),
+        "condition_retrieval_margin": retrieval_margin.item(),
+        "branch_balance_loss": balance_loss.item(),
+        "condition_diversity_loss": diversity_loss.item(),
+        "condition_similarity_selected": _masked_mean(winner_similarities, future_mask).item(),
+        "root_valid_count": plan_valid_mask[:, 0].sum().item(),
+        "future_valid_count": future_mask.sum().item(),
+        "condition_temporal_query_count": (
+            float(valid_conditions.shape[0]) if valid_conditions.shape[0] > 1 else 0.0
+        ),
+        "plan_valid_ratio": plan_valid_mask.float().mean().item(),
+    }
+    metrics.update(queue_metrics)
+    hard_assignments = torch.nn.functional.one_hot(winners, num_classes=predicted_actions.shape[2]).float()
+    for branch_idx in range(predicted_actions.shape[2]):
+        metrics[f"branch{branch_idx}_winner_rate"] = _masked_mean(
+            hard_assignments[..., branch_idx], future_mask
+        ).item()
+        metrics[f"branch{branch_idx}_soft_usage"] = branch_usage[branch_idx].item()
+    for future_idx in range(winners.shape[1]):
+        slot_mask = future_mask[:, future_idx]
+        slot_number = future_idx + 1
+        metrics[f"future_slot{slot_number}_valid_count"] = slot_mask.sum().item()
+        for branch_idx in range(predicted_actions.shape[2]):
+            metrics[f"future_slot{slot_number}_branch{branch_idx}_winner_rate"] = _masked_mean(
+                hard_assignments[:, future_idx, branch_idx], slot_mask
+            ).item()
+    return loss, winners, metrics
 
 
 def diagonal_gaussian_nll(
@@ -427,6 +1027,49 @@ def compute_condition_similarity_tensors(
     return similarities, future_patch_embeddings, {}
 
 
+def compute_projected_condition_targets(
+    vla,
+    condition_adapter: IndoorUAVConditionAdapter,
+    cond_hidden_states: torch.Tensor,
+    future_pixel_values: torch.Tensor,
+    patch_topk: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode future labels and compare them with projected future condition branches."""
+    if future_pixel_values.shape[1] != cond_hidden_states.shape[1] - 1:
+        raise ValueError("future image labels must correspond to condition slots 1..T-1")
+
+    adapter = condition_adapter.module if hasattr(condition_adapter, "module") else condition_adapter
+    base_vla = _unwrap_vla_model(vla)
+    vision_backbone = base_vla.vision_backbone
+    old_num_images = vision_backbone.get_num_images_in_input()
+    batch_size, horizon, channels, height, width = future_pixel_values.shape
+    future_images = future_pixel_values.reshape(batch_size * horizon, channels, height, width)
+    try:
+        vision_backbone.set_num_images_in_input(1)
+        # The shared vision encoder is a stable target encoder. The learned vision
+        # matching projector below remains outside no_grad and receives gradients.
+        with torch.no_grad():
+            raw_patch_embeddings = base_vla._process_vision_features(future_images, use_film=False)
+    finally:
+        vision_backbone.set_num_images_in_input(old_num_images)
+
+    raw_patch_embeddings = raw_patch_embeddings.reshape(
+        batch_size,
+        horizon,
+        raw_patch_embeddings.shape[1],
+        raw_patch_embeddings.shape[2],
+    )
+    projected_conditions = adapter.project_conditions(cond_hidden_states[:, 1:])
+    future_patch_embeddings = adapter.project_vision(raw_patch_embeddings)
+    similarities, topk_indices = projected_condition_to_patch_similarity(
+        projected_conditions,
+        future_patch_embeddings,
+        patch_topk,
+        return_indices=True,
+    )
+    return projected_conditions, future_patch_embeddings, similarities, topk_indices
+
+
 def compute_condition_contrastive_loss(
     selected_condition_embeddings: torch.Tensor,
     target_image_embeddings: torch.Tensor,
@@ -575,7 +1218,10 @@ def _unnormalize_actions_for_reward(actions: torch.Tensor, action_norm_stats: Op
     if action_norm_stats is None:
         return actions
 
-    if "q01" in action_norm_stats and "q99" in action_norm_stats:
+    if "normalization_low" in action_norm_stats and "normalization_high" in action_norm_stats:
+        action_low = _stats_tensor(action_norm_stats["normalization_low"], actions.device)
+        action_high = _stats_tensor(action_norm_stats["normalization_high"], actions.device)
+    elif "q01" in action_norm_stats and "q99" in action_norm_stats:
         action_low = _stats_tensor(action_norm_stats["q01"], actions.device)
         action_high = _stats_tensor(action_norm_stats["q99"], actions.device)
     elif "min" in action_norm_stats and "max" in action_norm_stats:
@@ -589,9 +1235,135 @@ def _unnormalize_actions_for_reward(actions: torch.Tensor, action_norm_stats: Op
     return torch.where(mask, unnormalized, actions)
 
 
+def compute_root_action_axis_metrics(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    action_norm_stats: Optional[dict],
+) -> Dict[str, float]:
+    """Report physical root-action bias and sign accuracy for each body axis."""
+    root_predictions = (
+        predicted_actions[:, 0, 0] if predicted_actions.ndim == 4 else predicted_actions[:, 0]
+    )
+    root_targets = ground_truth_actions[:, 0]
+    root_predictions = _unnormalize_actions_for_reward(root_predictions.detach(), action_norm_stats)
+    root_targets = _unnormalize_actions_for_reward(root_targets.detach(), action_norm_stats)
+
+    metrics = {}
+    for axis, name in enumerate(("forward", "right", "up", "yaw")):
+        prediction = root_predictions[:, axis]
+        target = root_targets[:, axis]
+        nonzero = target.abs() > 1e-4
+        sign_accuracy = (
+            (torch.sign(prediction[nonzero]) == torch.sign(target[nonzero])).float().mean()
+            if nonzero.any()
+            else prediction.new_zeros(())
+        )
+        metrics.update(
+            {
+                f"root_{name}_prediction_mean": prediction.mean().item(),
+                f"root_{name}_target_mean": target.mean().item(),
+                f"root_{name}_bias": (prediction - target).mean().item(),
+                f"root_{name}_abs_error": (prediction - target).abs().mean().item(),
+                f"root_{name}_sign_accuracy": sign_accuracy.item(),
+                f"root_{name}_nonzero_count": float(nonzero.sum().item()),
+            }
+        )
+    return metrics
+
+
 def _wrapped_abs_yaw_error(pred_yaw: torch.Tensor, target_yaw: torch.Tensor) -> torch.Tensor:
     diff = torch.remainder(pred_yaw - target_yaw + torch.pi, 2 * torch.pi) - torch.pi
     return diff.abs()
+
+
+def _oracle_recovery(oracle_loss: float, selected_loss: float, branch0_loss: float) -> float:
+    """Fraction of the available branch-0-to-oracle improvement recovered by matching."""
+    available_gain = branch0_loss - oracle_loss
+    if available_gain <= 1e-8:
+        return 1.0 if selected_loss <= oracle_loss + 1e-8 else 0.0
+    return (branch0_loss - selected_loss) / available_gain
+
+
+def compute_condition_selected_action_metrics(
+    predicted_actions: torch.Tensor,
+    ground_truth_actions: torch.Tensor,
+    condition_similarities: torch.Tensor,
+    plan_valid_mask: torch.Tensor,
+    action_norm_stats: Optional[dict],
+) -> Dict[str, float]:
+    """Compare inference-time condition selection with oracle and fixed branch 0."""
+    if predicted_actions.ndim != 4 or ground_truth_actions.ndim != 3:
+        raise ValueError("condition-selected metrics require (B,T,K,D) predictions and (B,T,D) targets")
+    if predicted_actions.shape[:2] != ground_truth_actions.shape[:2]:
+        raise ValueError("prediction and target batch/time dimensions must match")
+    if condition_similarities.shape != predicted_actions[:, 1:, :, 0].shape:
+        raise ValueError("condition similarities must have shape (B,T-1,K)")
+    if plan_valid_mask.shape != ground_truth_actions.shape[:2]:
+        raise ValueError("plan_valid_mask must have shape (B,T)")
+
+    future_predictions = predicted_actions[:, 1:].float()
+    future_targets = ground_truth_actions[:, 1:].float()
+    future_mask = plan_valid_mask[:, 1:].bool()
+    action_errors = torch.nn.functional.smooth_l1_loss(
+        future_predictions,
+        future_targets[:, :, None, :].expand_as(future_predictions),
+        reduction="none",
+    ).mean(dim=-1)
+    oracle_indices = action_errors.argmin(dim=-1)
+    condition_indices = condition_similarities.detach().argmax(dim=-1)
+
+    def gather_branch(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        gather_index = indices.unsqueeze(-1)
+        while gather_index.ndim < values.ndim:
+            gather_index = gather_index.unsqueeze(-1)
+        return values.gather(
+            2,
+            gather_index.expand(*values.shape[:2], 1, *values.shape[3:]),
+        ).squeeze(2)
+
+    oracle_errors = action_errors.gather(2, oracle_indices.unsqueeze(-1)).squeeze(-1)
+    selected_errors = action_errors.gather(2, condition_indices.unsqueeze(-1)).squeeze(-1)
+    branch0_errors = action_errors[:, :, 0]
+    oracle_loss = _masked_mean(oracle_errors, future_mask).item()
+    selected_loss = _masked_mean(selected_errors, future_mask).item()
+    branch0_loss = _masked_mean(branch0_errors, future_mask).item()
+
+    real_predictions = _unnormalize_actions_for_reward(future_predictions.detach(), action_norm_stats)
+    real_targets = _unnormalize_actions_for_reward(future_targets.detach(), action_norm_stats)
+    oracle_actions = gather_branch(real_predictions, oracle_indices)
+    selected_actions = gather_branch(real_predictions, condition_indices)
+    branch0_actions = real_predictions[:, :, 0]
+
+    def physical_errors(actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        position = torch.linalg.vector_norm(actions[..., :3] - real_targets[..., :3], dim=-1)
+        yaw = _wrapped_abs_yaw_error(actions[..., 3], real_targets[..., 3])
+        return position, yaw
+
+    oracle_position, oracle_yaw = physical_errors(oracle_actions)
+    selected_position, selected_yaw = physical_errors(selected_actions)
+    branch0_position, branch0_yaw = physical_errors(branch0_actions)
+    metrics = {
+        "oracle_future_action_loss": oracle_loss,
+        "condition_selected_action_loss": selected_loss,
+        "branch0_future_action_loss": branch0_loss,
+        "condition_selection_regret": selected_loss - oracle_loss,
+        "condition_gain_vs_branch0": branch0_loss - selected_loss,
+        "condition_oracle_recovery": _oracle_recovery(oracle_loss, selected_loss, branch0_loss),
+        "oracle_action_position_error_m": _masked_mean(oracle_position, future_mask).item(),
+        "condition_selected_position_error_m": _masked_mean(selected_position, future_mask).item(),
+        "branch0_position_error_m": _masked_mean(branch0_position, future_mask).item(),
+        "oracle_action_yaw_error_rad": _masked_mean(oracle_yaw, future_mask).item(),
+        "condition_selected_yaw_error_rad": _masked_mean(selected_yaw, future_mask).item(),
+        "branch0_yaw_error_rad": _masked_mean(branch0_yaw, future_mask).item(),
+    }
+    selected_one_hot = torch.nn.functional.one_hot(
+        condition_indices, num_classes=predicted_actions.shape[2]
+    ).float()
+    for branch_idx in range(predicted_actions.shape[2]):
+        metrics[f"condition_branch{branch_idx}_selected_rate"] = _masked_mean(
+            selected_one_hot[..., branch_idx], future_mask
+        ).item()
+    return metrics
 
 
 def compute_offline_branch_reward_tensors(
@@ -875,6 +1647,8 @@ class FinetuneConfig:
     relative_action_targets: bool = False            # Predict cumulative pose offsets from the current UAV state
     future_action_stride: int = 1                    # Raw RLDS step spacing between the T future targets
     relative_action_wrap_yaw: bool = False           # False matches PAI-0 DeltaActions (plain yaw subtraction)
+    body_delta_action_targets: bool = False           # IndoorUAV one-step body-frame deltas from absolute poses
+    cyclic_yaw_proprio: bool = False                 # Model state is [x,y,z,sin(yaw),cos(yaw)] after action conversion
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -890,18 +1664,36 @@ class FinetuneConfig:
     use_best_of_k_action_loss: bool = False          # Assign one winning action branch independently at each future time
     branch_assignment_temperature: float = 0.1       # Soft assignment temperature used by branch balancing
     branch_balance_weight: float = 0.0               # Weight for uniform branch utilization regularization
-    condition_assignment_weight: float = 0.0         # Condition cost used when assigning each paired branch
+    condition_assignment_weight: float = 0.0         # Legacy joint assignment; must be 0 for IndoorUAV action-supervised pairing
     initial_action_branch_index: int = -1             # Fixed branch at t=0; -1 keeps unconstrained best-of-K
     use_cond_action_tokens: bool = False             # If True, use explicit T x K COND/ACT placeholder tokens
     couple_condition_to_action_branch: bool = False  # Align the condition that belongs to the winning action branch
     condition_similarity_threshold: float = 0.2      # Threshold used only for condition-alignment diagnostics
     condition_alignment_weight: float = 0.0          # Weight for selected condition/future-image alignment loss
-    condition_contrastive_weight: float = 0.0        # Weight for per-time K-way condition branch selection
+    condition_contrastive_weight: float = 0.0        # Weight for inference-aligned per-time K-way branch selection
+    condition_temporal_weight: float = 0.0           # Weight for matching each selected condition to its future time image
+    condition_queue_weight: float = 0.0              # Weight for cross-episode image-queue contrastive learning
+    condition_queue_size: int = 256                  # Number of detached future-image patch sets retained on device
+    condition_queue_min_negatives: int = 32          # Eligible other-episode images required before queue loss starts
     condition_contrastive_temperature: float = 0.07  # Softmax temperature for condition branch selection
     condition_loss_start_time_index: int = 0         # First condition time supervised; use 1 when condition at t=0 is unused
     condition_patch_topk: int = 8                    # Strongest visual-token matches averaged per condition
     condition_diversity_weight: float = 0.0          # Weight for condition branch diversity loss
     condition_diversity_margin: float = 0.05         # Minimum desired cosine distance between condition branches
+    use_indoor_uav_condition_adapter: bool = False    # Learned image roles and 512-D condition/vision matching space
+    condition_match_dim: int = 512                   # Shared condition/vision matching dimension
+    condition_match_hidden_dim: int = 1024           # Hidden width of both matching projectors
+    use_indoor_uav_stop_head: bool = False           # Stop after executing the predicted root action
+    use_indoor_uav_progress_stop_head: bool = False  # Fuse root ACT/COND and add remaining-step supervision
+    stop_head_hidden_dim: int = 1024                 # Hidden width of the root STOP classifier
+    stop_progress_projection_dim: int = 512          # Per-token projection before ACT/COND fusion
+    stop_progress_loss_weight: float = 0.25          # Weight for <=1/2/4 remaining-step auxiliary BCE
+    stop_initial_positive_rate: float = 0.05         # Classifier prior before STOP training
+    stop_loss_weight: float = 0.1                    # Weight of terminal BCE in the SFT objective
+    stop_positive_weight: float = 0.0                # 0 derives the BCE weight from dataset counts
+    stop_threshold: float = 0.5                      # Inference probability threshold
+    root_action_weight: float = 1.0                  # SFT weight for slot-0 branch-0 action
+    future_action_weight: float = 1.0                # SFT weight for selected future actions
     branch_diversity_weight: float = 0.0             # Weight for multi-branch diversity regularization
     branch_diversity_margin: float = 0.05            # Minimum desired mean L1 distance between action branches
     grpo_reward_weight: float = 0.0                  # Weight for GRPO-style branch reward optimization
@@ -915,6 +1707,7 @@ class FinetuneConfig:
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_image_history: bool = False                  # If True, uses num_images_in_input primary-camera history frames
     require_full_image_history: bool = True          # If True, skips chunks with padded history frames
+    use_reference_previous_current: bool = False     # Input roles are [ref_image, previous, current]
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
     # Training configuration
@@ -927,6 +1720,8 @@ class FinetuneConfig:
     seed: int = 17                                   # Shared RNG seed for reproducible A/B experiments
     max_steps: int = 200_000                         # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
+    train_tfds_split: Optional[str] = None            # Explicit training split, e.g. train[:95%]
+    val_tfds_split: Optional[str] = None              # Explicit validation split, e.g. train[95%:]
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
@@ -937,6 +1732,7 @@ class FinetuneConfig:
     auxiliary_init_checkpoint_path: Optional[Path] = None  # Load external projectors/heads without resuming LoRA
     auxiliary_init_checkpoint_step: Optional[int] = None   # Component step inside auxiliary_init_checkpoint_path
     reset_action_head: bool = False                  # Do not load action_head from auxiliary initialization checkpoint
+    reset_proprio_projector: bool = False            # Reinitialize projector when the proprio representation changes
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -955,6 +1751,7 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    train_report_freq: int = 50                      # Local stdout diagnostic frequency in optimizer steps
     debug_batch_shapes: bool = False                 # If True, print batch/action/mask shapes for initial batches
     debug_grad_norm: bool = False                    # If True, print gradient norms for trainable components
     debug_num_batches: int = 2                       # Number of initial batches to print when debug flags are enabled
@@ -962,6 +1759,8 @@ class FinetuneConfig:
     overfit_report_freq: int = 25                    # Step interval for fixed-batch overfit loss reports
     freeze_vla: bool = False                         # Freeze the VLA backbone and any attached LoRA parameters
     freeze_proprio_projector: bool = False           # Freeze the proprio projector while training other components
+    freeze_action_head: bool = False                 # Freeze continuous actions while fitting auxiliary heads
+    freeze_condition_adapter: bool = False           # Freeze image roles and condition projectors
 
     # fmt: on
 
@@ -1088,6 +1887,7 @@ def init_module(
     module_args: dict,
     to_bf16: bool = False,
     find_unused_params: bool = False,
+    allow_missing_auxiliary: bool = False,
 ) -> DDP:
     """
     Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
@@ -1112,19 +1912,29 @@ def init_module(
         module.load_state_dict(state_dict)
         print(f"Initialized {module_name} from resume checkpoint step {cfg.resume_step}")
     elif cfg.auxiliary_init_checkpoint_path is not None:
-        if module_name == "action_head" and cfg.reset_action_head:
-            print("Resetting action_head; auxiliary action-head weights were intentionally not loaded")
+        reset_from_auxiliary = (
+            (module_name == "action_head" and cfg.reset_action_head)
+            or (module_name == "proprio_projector" and cfg.reset_proprio_projector)
+        )
+        if reset_from_auxiliary:
+            print(f"Resetting {module_name}; auxiliary weights were intentionally not loaded")
         else:
-            state_dict = load_checkpoint(
-                module_name,
-                str(cfg.auxiliary_init_checkpoint_path),
-                cfg.auxiliary_init_checkpoint_step,
-            )
-            module.load_state_dict(state_dict)
-            print(
-                f"Initialized {module_name} from auxiliary checkpoint "
-                f"{cfg.auxiliary_init_checkpoint_path} step {cfg.auxiliary_init_checkpoint_step}"
-            )
+            try:
+                state_dict = load_checkpoint(
+                    module_name,
+                    str(cfg.auxiliary_init_checkpoint_path),
+                    cfg.auxiliary_init_checkpoint_step,
+                )
+            except FileNotFoundError:
+                if not allow_missing_auxiliary:
+                    raise
+                print(f"Initializing new {module_name}; no component exists in the auxiliary checkpoint")
+            else:
+                module.load_state_dict(state_dict)
+                print(
+                    f"Initialized {module_name} from auxiliary checkpoint "
+                    f"{cfg.auxiliary_init_checkpoint_path} step {cfg.auxiliary_init_checkpoint_step}"
+                )
 
     if to_bf16:
         module = module.to(torch.bfloat16)
@@ -1136,6 +1946,8 @@ def init_module(
 def run_forward_pass(
     vla,
     action_head,
+    condition_adapter,
+    stop_head,
     noisy_action_projector,
     proprio_projector,
     batch,
@@ -1171,11 +1983,23 @@ def run_forward_pass(
     condition_similarity_threshold=0.2,
     condition_alignment_weight=0.0,
     condition_contrastive_weight=0.0,
+    condition_temporal_weight=0.0,
+    condition_queue_weight=0.0,
+    condition_queue_min_negatives=1,
+    condition_negative_queue: Optional[CrossEpisodeImageQueue] = None,
     condition_contrastive_temperature=0.07,
     condition_loss_start_time_index=0,
     condition_patch_topk=8,
     condition_diversity_weight=0.0,
     condition_diversity_margin=0.05,
+    root_action_weight=1.0,
+    future_action_weight=1.0,
+    stop_loss_weight=0.0,
+    stop_positive_weight=1.0,
+    stop_threshold=0.5,
+    use_progress_stop_head=False,
+    stop_progress_positive_weights=None,
+    stop_progress_loss_weight=0.0,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     debug_batch_shapes=False,
@@ -1215,6 +2039,18 @@ def run_forward_pass(
     if future_pixel_values is not None:
         future_pixel_values = future_pixel_values.to(torch.bfloat16).to(device_id)
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+    image_valid_mask = batch.get("image_valid_mask")
+    if image_valid_mask is not None:
+        image_valid_mask = image_valid_mask.to(device_id)
+    plan_valid_mask = batch.get("plan_valid_mask")
+    if plan_valid_mask is not None:
+        plan_valid_mask = plan_valid_mask.to(device_id)
+    stop_after_action = batch.get("stop_after_action")
+    if stop_after_action is not None:
+        stop_after_action = stop_after_action.to(device_id)
+    actions_remaining_after_root = batch.get("actions_remaining_after_root")
+    if actions_remaining_after_root is not None:
+        actions_remaining_after_root = actions_remaining_after_root.to(device_id)
     proprio = batch["proprio"].to(device_id).to(torch.bfloat16) if use_proprio else None
     labels = batch["labels"].to(device_id)
     debug_info = {}
@@ -1250,6 +2086,13 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
+            image_valid_mask=image_valid_mask,
+            image_role_embeddings=(
+                (condition_adapter.module if hasattr(condition_adapter, "module") else condition_adapter)
+                .image_role_embeddings
+                if condition_adapter is not None
+                else None
+            ),
         )
 
     # Get action masks needed for logging，找到哪些token对应当前动作，哪些token位置对应未来动作，生成action masks
@@ -1276,6 +2119,16 @@ def run_forward_pass(
                 "ground_truth_actions_device": _device(ground_truth_actions),
                 "image_history_pad_mask": (
                     batch["image_history_pad_mask"].tolist() if "image_history_pad_mask" in batch else "None"
+                ),
+                "image_valid_mask": image_valid_mask.tolist() if image_valid_mask is not None else "None",
+                "plan_valid_mask": plan_valid_mask.tolist() if plan_valid_mask is not None else "None",
+                "stop_after_action": (
+                    stop_after_action.tolist() if stop_after_action is not None else "None"
+                ),
+                "actions_remaining_after_root": (
+                    actions_remaining_after_root.tolist()
+                    if actions_remaining_after_root is not None
+                    else "None"
                 ),
                 "current_action_mask_sum": int(current_action_mask.sum().item()),
                 "current_action_mask_device": _device(current_action_mask),
@@ -1360,7 +2213,42 @@ def run_forward_pass(
                 debug_info["action_log_std"] = _shape(action_log_std)
                 debug_info["action_log_std_device"] = _device(action_log_std)
 
-            if cond_hidden_states is not None and future_pixel_values is not None:
+            projected_conditions = None
+            topk_patch_indices = None
+            if condition_adapter is not None:
+                if cond_hidden_states is None or future_pixel_values is None or plan_valid_mask is None:
+                    raise ValueError(
+                        "IndoorUAV condition SFT requires COND tokens, future images, and plan_valid_mask"
+                    )
+                (
+                    projected_conditions,
+                    future_patch_embeddings,
+                    condition_similarities,
+                    topk_patch_indices,
+                ) = compute_projected_condition_targets(
+                    vla=vla,
+                    condition_adapter=condition_adapter,
+                    cond_hidden_states=cond_hidden_states,
+                    future_pixel_values=future_pixel_values,
+                    patch_topk=condition_patch_topk,
+                )
+                metrics.update(
+                    {
+                        "condition_similarity_mean": condition_similarities.mean().item(),
+                        "condition_patch_topk": float(condition_patch_topk),
+                        "condition_match_dim": float(projected_conditions.shape[-1]),
+                    }
+                )
+                if debug_batch_shapes:
+                    debug_info.update(
+                        {
+                            "projected_conditions": _shape(projected_conditions),
+                            "future_patch_embeddings": _shape(future_patch_embeddings),
+                            "condition_similarities": _shape(condition_similarities),
+                            "topk_patch_indices": _shape(topk_patch_indices),
+                        }
+                    )
+            elif cond_hidden_states is not None and future_pixel_values is not None:
                 (
                     condition_similarities,
                     future_patch_embeddings,
@@ -1374,7 +2262,85 @@ def run_forward_pass(
                 )
                 metrics.update(condition_precompute_metrics)
 
-            if use_gaussian_action_head and predicted_actions.ndim == 4 and use_best_of_k_action_loss:
+            if condition_adapter is not None:
+                queued_image_patches, queued_episode_ids = (
+                    condition_negative_queue.entries()
+                    if condition_negative_queue is not None
+                    else (None, [])
+                )
+                loss, future_winners, assignment_metrics = compute_indoor_uav_sft_loss(
+                    predicted_actions=predicted_actions,
+                    ground_truth_actions=ground_truth_actions,
+                    projected_conditions=projected_conditions,
+                    future_patch_embeddings=future_patch_embeddings,
+                    condition_similarities=condition_similarities,
+                    plan_valid_mask=plan_valid_mask,
+                    assignment_temperature=branch_assignment_temperature,
+                    root_action_weight=root_action_weight,
+                    future_action_weight=future_action_weight,
+                    condition_alignment_weight=condition_alignment_weight,
+                    condition_contrastive_weight=condition_contrastive_weight,
+                    condition_temporal_weight=condition_temporal_weight,
+                    condition_queue_weight=condition_queue_weight,
+                    condition_contrastive_temperature=condition_contrastive_temperature,
+                    branch_balance_weight=branch_balance_weight,
+                    condition_diversity_weight=condition_diversity_weight,
+                    condition_diversity_margin=condition_diversity_margin,
+                    patch_topk=condition_patch_topk,
+                    query_episode_ids=batch.get("episode_ids"),
+                    queued_image_patches=queued_image_patches,
+                    queued_episode_ids=queued_episode_ids,
+                    condition_queue_min_negatives=condition_queue_min_negatives,
+                )
+                assignment_metrics.update(
+                    compute_condition_selected_action_metrics(
+                        predicted_actions=predicted_actions,
+                        ground_truth_actions=ground_truth_actions,
+                        condition_similarities=condition_similarities,
+                        plan_valid_mask=plan_valid_mask,
+                        action_norm_stats=action_norm_stats,
+                    )
+                )
+                if condition_negative_queue is not None:
+                    valid_future_mask = plan_valid_mask[:, 1:].bool()
+                    current_episode_ids = _valid_future_episode_ids(
+                        batch.get("episode_ids"), valid_future_mask
+                    )
+                    condition_negative_queue.enqueue(
+                        future_patch_embeddings[valid_future_mask], current_episode_ids
+                    )
+                    assignment_metrics["condition_queue_size"] = float(len(condition_negative_queue))
+                action_winner_indices = torch.cat(
+                    [
+                        torch.zeros(
+                            future_winners.shape[0],
+                            1,
+                            dtype=future_winners.dtype,
+                            device=future_winners.device,
+                        ),
+                        future_winners,
+                    ],
+                    dim=1,
+                )
+                metrics.update(assignment_metrics)
+            elif (
+                predicted_actions.ndim == 4
+                and predicted_actions.shape[2] == 1
+                and plan_valid_mask is not None
+                and use_cond_action_tokens
+            ):
+                loss, single_branch_metrics = compute_masked_single_branch_sft_loss(
+                    predicted_actions,
+                    ground_truth_actions,
+                    plan_valid_mask,
+                    root_action_weight=root_action_weight,
+                    future_action_weight=future_action_weight,
+                )
+                action_winner_indices = torch.zeros(
+                    predicted_actions.shape[:2], dtype=torch.long, device=predicted_actions.device
+                )
+                metrics.update(single_branch_metrics)
+            elif use_gaussian_action_head and predicted_actions.ndim == 4 and use_best_of_k_action_loss:
                 (
                     loss,
                     branch_balance_loss,
@@ -1436,7 +2402,7 @@ def run_forward_pass(
                     }
                 )
 
-            if cond_hidden_states is not None and future_pixel_values is not None:
+            if condition_adapter is None and cond_hidden_states is not None and future_pixel_values is not None:
                 selected_condition_branches = (
                     action_winner_indices if couple_condition_to_action_branch else None
                 )
@@ -1466,7 +2432,7 @@ def run_forward_pass(
                 loss = loss + condition_contrastive_weight * condition_contrastive_loss
             if condition_diversity_loss is not None and condition_diversity_weight > 0:
                 loss = loss + condition_diversity_weight * condition_diversity_loss
-            if predicted_actions.ndim == 4 and branch_diversity_weight > 0:
+            if condition_adapter is None and predicted_actions.ndim == 4 and branch_diversity_weight > 0:
                 branch_pair_distances = []
                 for left_branch in range(predicted_actions.shape[2]):
                     for right_branch in range(left_branch + 1, predicted_actions.shape[2]):
@@ -1485,7 +2451,7 @@ def run_forward_pass(
                         "branch_mean_distance": branch_mean_distance.item(),
                     }
                 )
-            if predicted_actions.ndim == 4 and grpo_reward_weight > 0:
+            if condition_adapter is None and predicted_actions.ndim == 4 and grpo_reward_weight > 0:
                 if action_log_std is None or action_winner_indices is None:
                     raise ValueError("Gaussian GRPO requires a selected branch and action log standard deviation")
                 grpo_loss, grpo_metrics = compute_gaussian_group_relative_policy_loss(
@@ -1502,6 +2468,36 @@ def run_forward_pass(
                 )
                 loss = loss + grpo_reward_weight * grpo_loss
                 metrics.update(grpo_metrics)
+
+            if stop_head is not None:
+                if stop_after_action is None:
+                    raise ValueError("IndoorUAV STOP training requires stop_after_action labels")
+                if not use_cond_action_tokens or actions_hidden_states.ndim != 4:
+                    raise ValueError("IndoorUAV STOP head requires (B,T,K,D) ACT hidden states")
+                if use_progress_stop_head:
+                    if cond_hidden_states is None or actions_remaining_after_root is None:
+                        raise ValueError("progress STOP requires root COND states and remaining-step labels")
+                    stop_logits = stop_head.module(
+                        actions_hidden_states[:, 0, 0].float(),
+                        cond_hidden_states[:, 0, 0].float(),
+                    )
+                    stop_loss, stop_metrics = compute_progress_stop_loss(
+                        stop_logits,
+                        actions_remaining_after_root,
+                        stop_progress_positive_weights,
+                        stop_progress_loss_weight,
+                        threshold=stop_threshold,
+                    )
+                else:
+                    stop_logits = stop_head.module(actions_hidden_states[:, 0, 0].float())
+                    stop_loss, stop_metrics = compute_stop_after_action_loss(
+                        stop_logits,
+                        stop_after_action,
+                        stop_positive_weight,
+                        threshold=stop_threshold,
+                    )
+                loss = loss + stop_loss_weight * stop_loss
+                metrics.update(stop_metrics)
 
         if use_diffusion:
             # Predict noise
@@ -1563,6 +2559,13 @@ def run_forward_pass(
                 "curr_action_l1_loss": curr_action_l1_loss.item(),
                 "next_actions_l1_loss": next_actions_l1_loss.item(),
             }
+            l1_metrics.update(
+                compute_root_action_axis_metrics(
+                    predicted_actions,
+                    ground_truth_actions,
+                    action_norm_stats,
+                )
+            )
             if predicted_actions.ndim == 4:
                 branch_targets = ground_truth_actions.unsqueeze(2).expand_as(predicted_actions)
                 per_branch_l1 = torch.abs(predicted_actions - branch_targets).mean(dim=(1, 3))
@@ -1570,6 +2573,34 @@ def run_forward_pass(
                 l1_metrics["all_branches_l1_loss"] = per_branch_l1.mean().item()
                 l1_metrics["best_branch_l1_loss"] = per_branch_l1.min(dim=1).values.mean().item()
                 l1_metrics["best_of_k_time_l1_loss"] = per_time_branch_l1.min(dim=2).values.mean().item()
+                if predicted_actions.shape[2] > 1 and plan_valid_mask is not None:
+                    real_actions = _unnormalize_actions_for_reward(
+                        predicted_actions.detach().float(), action_norm_stats
+                    )[:, 1:]
+                    position_separations = []
+                    yaw_separations = []
+                    for left in range(predicted_actions.shape[2]):
+                        for right in range(left + 1, predicted_actions.shape[2]):
+                            position_separations.append(
+                                torch.linalg.vector_norm(
+                                    real_actions[:, :, left, :3] - real_actions[:, :, right, :3],
+                                    dim=-1,
+                                )
+                            )
+                            yaw_separations.append(
+                                _wrapped_abs_yaw_error(
+                                    real_actions[:, :, left, 3], real_actions[:, :, right, 3]
+                                )
+                            )
+                    future_mask = plan_valid_mask[:, 1:].bool()
+                    position_separations = torch.stack(position_separations, dim=-1)
+                    yaw_separations = torch.stack(yaw_separations, dim=-1)
+                    l1_metrics["action_branch_position_separation_m"] = _masked_mean(
+                        position_separations.mean(dim=-1), future_mask
+                    ).item()
+                    l1_metrics["action_branch_yaw_separation_rad"] = _masked_mean(
+                        yaw_separations.mean(dim=-1), future_mask
+                    ).item()
                 l1_metrics.update(
                     compute_offline_branch_rewards(predicted_actions, ground_truth_actions, action_norm_stats)
                 )
@@ -1693,6 +2724,19 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
     return smoothened_metrics
 
 
+def completed_optimizer_step(
+    batch_idx: int,
+    grad_accumulation_steps: int,
+    resume_step: int = 0,
+) -> Optional[int]:
+    """Return the absolute step only when this microbatch completes an optimizer update."""
+    if grad_accumulation_steps < 1:
+        raise ValueError("grad_accumulation_steps must be >= 1")
+    if (batch_idx + 1) % grad_accumulation_steps != 0:
+        return None
+    return resume_step + (batch_idx + 1) // grad_accumulation_steps
+
+
 #把指标记录到wandb上
 def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     """
@@ -1728,6 +2772,8 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    condition_adapter,
+    stop_head,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -1764,6 +2810,7 @@ def save_training_checkpoint(
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
         save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
+        save_policy_contract(cfg, train_dataset.dataset_statistics, checkpoint_dir)
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
@@ -1787,6 +2834,17 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        if condition_adapter is not None:
+            torch.save(
+                condition_adapter.state_dict(),
+                checkpoint_dir / f"condition_adapter--{checkpoint_name_suffix}",
+            )
+        if stop_head is not None:
+            torch.save(
+                stop_head.state_dict(),
+                checkpoint_dir / f"stop_head--{checkpoint_name_suffix}",
+            )
+
         if cfg.use_film:
             #如果用了FiLM,因为FiLM会改视觉backbone的参数，所以要保存视觉backbone的参数
             # To be safe, just save the entire vision backbone (not just FiLM components)
@@ -1807,21 +2865,66 @@ def save_training_checkpoint(
             base_vla.resize_token_embeddings(len(processor.tokenizer), pad_to_multiple_of=64)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
-        merged_vla.config.condition_target_fusion = "centered_condition_to_patch_topk"
+        merged_vla.config.condition_target_fusion = (
+            "learned_condition_to_patch_topk"
+            if cfg.use_indoor_uav_condition_adapter
+            else "centered_condition_to_patch_topk"
+        )
         merged_vla.config.condition_patch_topk = cfg.condition_patch_topk
-        merged_vla.config.condition_matching_centered = True
-        merged_vla.config.condition_contrastive_mode = "per_time_branch_selection"
+        merged_vla.config.condition_matching_centered = not cfg.use_indoor_uav_condition_adapter
+        merged_vla.config.condition_match_dim = cfg.condition_match_dim
+        merged_vla.config.condition_match_hidden_dim = cfg.condition_match_hidden_dim
+        merged_vla.config.use_indoor_uav_condition_adapter = cfg.use_indoor_uav_condition_adapter
+        merged_vla.config.proprio_representation = (
+            "xyz_sin_yaw_cos_yaw_v1" if cfg.cyclic_yaw_proprio else "dataset_default"
+        )
+        merged_vla.config.proprio_dim = get_model_proprio_dim(cfg)
+        merged_vla.config.action_normalization = (
+            "per_axis_symmetric_minmax_v1" if cfg.body_delta_action_targets else "dataset_default"
+        )
+        merged_vla.config.image_input_roles = (
+            ["reference", "previous", "current"] if cfg.use_reference_previous_current else None
+        )
+        merged_vla.config.condition_contrastive_mode = (
+            "per_time_k_way_plus_temporal_plus_cross_episode_queue"
+            if cfg.use_indoor_uav_condition_adapter
+            else "per_time_branch_selection"
+        )
+        merged_vla.config.condition_branch_assignment = "action_error_only"
+        merged_vla.config.condition_branch_weight = cfg.condition_contrastive_weight
+        merged_vla.config.condition_temporal_weight = cfg.condition_temporal_weight
+        merged_vla.config.condition_queue_weight = cfg.condition_queue_weight
+        merged_vla.config.condition_queue_size = cfg.condition_queue_size
+        merged_vla.config.condition_queue_min_negatives = cfg.condition_queue_min_negatives
+        merged_vla.config.use_indoor_uav_stop_head = cfg.use_indoor_uav_stop_head
+        merged_vla.config.use_indoor_uav_progress_stop_head = cfg.use_indoor_uav_progress_stop_head
+        merged_vla.config.stop_head_hidden_dim = cfg.stop_head_hidden_dim
+        merged_vla.config.stop_progress_projection_dim = cfg.stop_progress_projection_dim
+        merged_vla.config.stop_progress_horizons = list(STOP_PROGRESS_HORIZONS)
+        merged_vla.config.stop_threshold = cfg.stop_threshold
+        merged_vla.config.stop_target_semantics = (
+            "execute_root_action_then_stop" if cfg.use_indoor_uav_stop_head else None
+        )
         merged_vla.config.action_head_type = (
             "gaussian" if cfg.use_gaussian_action_head else ("diffusion" if cfg.use_diffusion else "l1")
         )
         merged_vla.config.num_action_branches = cfg.num_action_branches
         merged_vla.config.use_cond_action_tokens = cfg.use_cond_action_tokens
-        merged_vla.config.condition_action_pairing = "per_time_joint_assignment"
+        merged_vla.config.condition_action_pairing = "per_time_action_error_assignment"
         merged_vla.config.condition_assignment_weight = cfg.condition_assignment_weight
         merged_vla.config.initial_action_branch_index = cfg.initial_action_branch_index
         merged_vla.config.condition_loss_start_time_index = cfg.condition_loss_start_time_index
         merged_vla.config.grpo_group_size = cfg.grpo_group_size
-        merged_vla.config.grpo_exact_gaussian_log_prob = True
+        merged_vla.config.grpo_exact_gaussian_log_prob = cfg.grpo_reward_weight > 0
+        if cfg.body_delta_action_targets:
+            merged_vla.config.action_representation = "body_delta_one_step_v1"
+        elif cfg.relative_action_targets:
+            merged_vla.config.action_representation = "relative_plan_origin"
+        else:
+            merged_vla.config.action_representation = "dataset_default"
+        merged_vla.config.training_objective = (
+            "sft" if cfg.grpo_reward_weight == 0 else "sft_plus_grpo"
+        )
         if cfg.use_gaussian_action_head:
             merged_vla.config.gaussian_log_std_min = cfg.gaussian_log_std_min
             merged_vla.config.gaussian_log_std_max = cfg.gaussian_log_std_max
@@ -1836,10 +2939,165 @@ def save_training_checkpoint(
         _distributed_barrier()
 
 
+def aggregate_validation_metrics(all_metrics: list[Dict[str, float]]) -> Dict[str, float]:
+    """Aggregate validation metrics by their actual number of valid queries."""
+    if not all_metrics:
+        raise ValueError("cannot aggregate an empty validation result")
+
+    count_metrics = {
+        "root_valid_count",
+        "future_valid_count",
+        "condition_temporal_query_count",
+        "condition_queue_queries",
+        "stop_true_positive",
+        "stop_true_negative",
+        "stop_false_positive",
+        "stop_false_negative",
+        "stop_sample_count",
+        "stop_positive_count",
+        "stop_negative_count",
+    }
+    root_metrics = {
+        "sft_root_action_loss",
+        "stop_loss",
+        "stop_probability_mean",
+        "stop_target_rate",
+        "stop_predicted_rate",
+        "stop_progress_aux_loss",
+        "stop_progress_total_loss",
+    }
+    future_metrics = {
+        "sft_future_action_loss",
+        "action_branch_pair_l1",
+        "action_branch_min_pair_l1",
+        "action_branch_position_separation_m",
+        "action_branch_yaw_separation_rad",
+        "action_winner_gap",
+        "action_winner_near_tie_rate",
+        "oracle_future_action_loss",
+        "condition_selected_action_loss",
+        "branch0_future_action_loss",
+        "condition_selection_regret",
+        "condition_gain_vs_branch0",
+        "condition_oracle_recovery",
+        "oracle_action_position_error_m",
+        "condition_selected_position_error_m",
+        "branch0_position_error_m",
+        "oracle_action_yaw_error_rad",
+        "condition_selected_yaw_error_rad",
+        "branch0_yaw_error_rad",
+        "condition_alignment_loss",
+        "condition_contrastive_loss",
+        "condition_branch_accuracy",
+        "condition_branch_random_accuracy",
+        "condition_branch_margin",
+        "condition_diversity_loss",
+        "condition_similarity_selected",
+        "branch_balance_loss",
+    }
+    temporal_metrics = {
+        "condition_temporal_loss",
+        "condition_retrieval_accuracy",
+        "condition_temporal_random_accuracy",
+        "condition_retrieval_positive",
+        "condition_retrieval_hardest_negative",
+        "condition_retrieval_margin",
+    }
+    queue_metrics = {
+        "condition_queue_loss",
+        "condition_queue_accuracy",
+        "condition_queue_random_accuracy",
+        "condition_queue_margin",
+        "condition_queue_negatives",
+    }
+
+    output = {}
+    metric_names = {
+        name for metrics in all_metrics for name in metrics if not name.startswith("_")
+    }
+    for metric_name in metric_names:
+        rows = [metrics for metrics in all_metrics if metric_name in metrics]
+        is_slot_count = metric_name.startswith("future_slot") and metric_name.endswith("_valid_count")
+        is_axis_nonzero_count = metric_name.startswith("root_") and metric_name.endswith("_nonzero_count")
+        if metric_name in count_metrics or is_slot_count or is_axis_nonzero_count:
+            output[metric_name] = sum(metrics[metric_name] for metrics in rows)
+            continue
+
+        weight_name = None
+        if metric_name in root_metrics:
+            weight_name = "root_valid_count"
+        elif metric_name.startswith("root_") and metric_name.endswith("_sign_accuracy"):
+            axis_name = metric_name.removeprefix("root_").removesuffix("_sign_accuracy")
+            weight_name = f"root_{axis_name}_nonzero_count"
+        elif metric_name.startswith("root_") and metric_name.endswith(
+            ("_prediction_mean", "_target_mean", "_bias", "_abs_error")
+        ):
+            weight_name = "root_valid_count"
+        elif metric_name in future_metrics or (
+            metric_name.startswith("branch")
+            and (metric_name.endswith("_winner_rate") or metric_name.endswith("_soft_usage"))
+        ) or (
+            metric_name.startswith("condition_branch")
+            and metric_name.endswith("_selected_rate")
+        ):
+            weight_name = "future_valid_count"
+        elif metric_name in temporal_metrics:
+            weight_name = "condition_temporal_query_count"
+        elif metric_name in queue_metrics:
+            weight_name = "condition_queue_queries"
+        elif metric_name.startswith("future_slot") and "_branch" in metric_name:
+            slot_prefix = metric_name.split("_branch", 1)[0]
+            weight_name = f"{slot_prefix}_valid_count"
+
+        if weight_name is None:
+            output[metric_name] = sum(metrics[metric_name] for metrics in rows) / len(rows)
+            continue
+
+        weighted_rows = [metrics for metrics in rows if metrics.get(weight_name, 0.0) > 0]
+        total_weight = sum(metrics[weight_name] for metrics in weighted_rows)
+        output[metric_name] = (
+            sum(metrics[metric_name] * metrics[weight_name] for metrics in weighted_rows) / total_weight
+            if total_weight > 0
+            else 0.0
+        )
+    required = (
+        "oracle_future_action_loss",
+        "condition_selected_action_loss",
+        "branch0_future_action_loss",
+    )
+    if all(name in output for name in required):
+        oracle_loss, selected_loss, branch0_loss = (output[name] for name in required)
+        output["condition_selection_regret"] = selected_loss - oracle_loss
+        output["condition_gain_vs_branch0"] = branch0_loss - selected_loss
+        output["condition_oracle_recovery"] = _oracle_recovery(
+            oracle_loss, selected_loss, branch0_loss
+        )
+    if output.get("stop_sample_count", 0.0) > 0:
+        tp = output.get("stop_true_positive", 0.0)
+        tn = output.get("stop_true_negative", 0.0)
+        fp = output.get("stop_false_positive", 0.0)
+        fn = output.get("stop_false_negative", 0.0)
+        sample_count = output["stop_sample_count"]
+        positive_count = tp + fn
+        negative_count = tn + fp
+        recall = tp / positive_count if positive_count else 0.0
+        specificity = tn / negative_count if negative_count else 0.0
+        output["stop_accuracy"] = (tp + tn) / sample_count
+        output["stop_precision"] = tp / (tp + fp) if tp + fp else 0.0
+        output["stop_recall"] = recall
+        output["stop_specificity"] = specificity
+        output["stop_balanced_accuracy"] = 0.5 * (recall + specificity)
+        output["stop_target_rate"] = positive_count / sample_count
+        output["stop_predicted_rate"] = (tp + fp) / sample_count
+    return output
+
+
 # 在验证集上计算指标
 def run_validation(
     vla,
     action_head,
+    condition_adapter,
+    stop_head,
     noisy_action_projector,
     proprio_projector,
     val_dataloader,
@@ -1853,6 +3111,7 @@ def run_validation(
     action_norm_stats=None,
     cond_token_ids=None,
     act_token_ids=None,
+    run_dir: Optional[Path] = None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -1880,6 +3139,13 @@ def run_validation(
 
     # List to store validation metrics
     all_val_metrics = []
+    stop_probabilities = []
+    stop_targets = []
+    validation_condition_queue = (
+        CrossEpisodeImageQueue(cfg.condition_queue_size)
+        if condition_adapter is not None and cfg.condition_queue_weight > 0
+        else None
+    )
 
     with torch.no_grad():
         for batch in val_dataloader:
@@ -1887,6 +3153,8 @@ def run_validation(
             _, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                condition_adapter=condition_adapter,
+                stop_head=stop_head,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
                 batch=batch,
@@ -1922,16 +3190,30 @@ def run_validation(
                 condition_similarity_threshold=cfg.condition_similarity_threshold,
                 condition_alignment_weight=cfg.condition_alignment_weight,
                 condition_contrastive_weight=cfg.condition_contrastive_weight,
+                condition_temporal_weight=cfg.condition_temporal_weight,
+                condition_queue_weight=cfg.condition_queue_weight,
+                condition_queue_min_negatives=cfg.condition_queue_min_negatives,
+                condition_negative_queue=validation_condition_queue,
                 condition_contrastive_temperature=cfg.condition_contrastive_temperature,
                 condition_loss_start_time_index=cfg.condition_loss_start_time_index,
                 condition_patch_topk=cfg.condition_patch_topk,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
+                root_action_weight=cfg.root_action_weight,
+                future_action_weight=cfg.future_action_weight,
+                stop_loss_weight=cfg.stop_loss_weight,
+                stop_positive_weight=cfg.stop_positive_weight,
+                stop_threshold=cfg.stop_threshold,
+                use_progress_stop_head=cfg.use_indoor_uav_progress_stop_head,
+                stop_progress_positive_weights=cfg.stop_progress_positive_weights,
+                stop_progress_loss_weight=cfg.stop_progress_loss_weight,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
 
             # Add the loss value to the metrics
+            stop_probabilities.extend(metrics.pop("_stop_probabilities", []))
+            stop_targets.extend(metrics.pop("_stop_targets", []))
             metrics["loss"] = metrics["loss_value"]
             all_val_metrics.append(metrics)
             val_batches_count += 1
@@ -1941,17 +3223,112 @@ def run_validation(
                 break
 
     # Compute average validation metrics
-    avg_val_metrics = {}
-    for metric_name in all_val_metrics[0].keys():
-        values = [metrics[metric_name] for metrics in all_val_metrics if metric_name in metrics]
-        if values:
-            avg_val_metrics[metric_name] = sum(values) / len(values)
+    avg_val_metrics = aggregate_validation_metrics(all_val_metrics)
+    stop_score_diagnostics = None
+    if stop_probabilities:
+        stop_score_diagnostics = compute_binary_score_diagnostics(
+            stop_probabilities,
+            stop_targets,
+        )
+        avg_val_metrics.update(stop_score_diagnostics)
 
     # Add batch count to metrics
     avg_val_metrics["val_batches_count"] = val_batches_count
 
     # Log validation metrics to W&B
     if distributed_state.is_main_process:
+        summary_keys = (
+            "loss",
+            "stop_loss",
+            "stop_accuracy",
+            "stop_balanced_accuracy",
+            "stop_precision",
+            "stop_recall",
+            "stop_specificity",
+            "stop_target_rate",
+            "stop_predicted_rate",
+            "stop_probability_mean",
+            "stop_progress_aux_loss",
+            "stop_progress_total_loss",
+            "stop_progress_h1_accuracy",
+            "stop_progress_h2_accuracy",
+            "stop_progress_h4_accuracy",
+            "stop_roc_auc",
+            "stop_positive_probability_mean",
+            "stop_negative_probability_mean",
+            "stop_probability_class_gap",
+            "stop_best_threshold",
+            "stop_best_balanced_accuracy",
+            "stop_best_precision",
+            "stop_best_recall",
+            "stop_best_specificity",
+            "sft_root_action_loss",
+            "sft_future_action_loss",
+            "root_forward_bias",
+            "root_forward_abs_error",
+            "root_forward_sign_accuracy",
+            "root_right_bias",
+            "root_right_abs_error",
+            "root_right_sign_accuracy",
+            "root_up_bias",
+            "root_up_abs_error",
+            "root_up_sign_accuracy",
+            "root_yaw_bias",
+            "root_yaw_abs_error",
+            "root_yaw_sign_accuracy",
+            "action_branch_pair_l1",
+            "action_branch_min_pair_l1",
+            "action_branch_position_separation_m",
+            "action_branch_yaw_separation_rad",
+            "action_winner_gap",
+            "action_winner_near_tie_rate",
+            "oracle_future_action_loss",
+            "condition_selected_action_loss",
+            "branch0_future_action_loss",
+            "condition_selection_regret",
+            "condition_gain_vs_branch0",
+            "condition_oracle_recovery",
+            "oracle_action_position_error_m",
+            "condition_selected_position_error_m",
+            "branch0_position_error_m",
+            "oracle_action_yaw_error_rad",
+            "condition_selected_yaw_error_rad",
+            "branch0_yaw_error_rad",
+            "condition_contrastive_loss",
+            "condition_branch_accuracy",
+            "condition_branch_random_accuracy",
+            "condition_branch_margin",
+            "condition_temporal_loss",
+            "condition_retrieval_accuracy",
+            "condition_temporal_random_accuracy",
+            "condition_retrieval_margin",
+            "condition_queue_loss",
+            "condition_queue_accuracy",
+            "condition_queue_random_accuracy",
+            "condition_queue_margin",
+            "branch0_winner_rate",
+            "branch1_winner_rate",
+            "branch2_winner_rate",
+        )
+        summary = ", ".join(
+            f"{key}={avg_val_metrics[key]:.6f}" for key in summary_keys if key in avg_val_metrics
+        )
+        print(f"[Validation] step={log_step}, batches={val_batches_count}, {summary}")
+        if stop_score_diagnostics is not None and run_dir is not None:
+            diagnostic_path = Path(run_dir) / f"stop_validation_step{log_step}.json"
+            with diagnostic_path.open("w", encoding="utf-8") as diagnostic_file:
+                json.dump(
+                    {
+                        "step": log_step,
+                        "num_samples": len(stop_targets),
+                        "probabilities": stop_probabilities,
+                        "targets": stop_targets,
+                        "diagnostics": stop_score_diagnostics,
+                    },
+                    diagnostic_file,
+                    indent=2,
+                )
+            print(f"[Validation] Saved STOP score audit to {diagnostic_path}")
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
 
@@ -1995,14 +3372,40 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
     if cfg.resume and auxiliary_path_set:
         raise ValueError("resume and auxiliary_init_checkpoint_path cannot be used together")
-    if cfg.reset_action_head and not auxiliary_path_set:
-        raise ValueError("reset_action_head requires auxiliary_init_checkpoint_path")
+    if cfg.cyclic_yaw_proprio and not cfg.body_delta_action_targets:
+        raise ValueError("cyclic_yaw_proprio requires body_delta_action_targets=True")
     if cfg.overfit_fixed_batch_count < 0:
         raise ValueError("overfit_fixed_batch_count must be >= 0")
     if cfg.overfit_report_freq < 1:
         raise ValueError("overfit_report_freq must be >= 1")
     if cfg.freeze_proprio_projector and not cfg.use_proprio:
         raise ValueError("freeze_proprio_projector requires use_proprio=True")
+    if cfg.freeze_action_head and not cfg.use_l1_regression:
+        raise ValueError("freeze_action_head requires use_l1_regression=True")
+    if cfg.freeze_condition_adapter and not cfg.use_indoor_uav_condition_adapter:
+        raise ValueError("freeze_condition_adapter requires use_indoor_uav_condition_adapter=True")
+    if cfg.use_indoor_uav_stop_head:
+        if not (cfg.use_l1_regression and cfg.use_cond_action_tokens):
+            raise ValueError("IndoorUAV STOP head requires continuous COND/ACT-token SFT")
+        if not cfg.use_indoor_uav_condition_adapter:
+            raise ValueError("IndoorUAV STOP head requires the IndoorUAV condition adapter contract")
+        if cfg.stop_head_hidden_dim < 1:
+            raise ValueError("stop_head_hidden_dim must be positive")
+        if cfg.stop_loss_weight <= 0:
+            raise ValueError("stop_loss_weight must be > 0 when STOP is enabled")
+        if cfg.stop_positive_weight < 0:
+            raise ValueError("stop_positive_weight must be >= 0")
+        if not 0 < cfg.stop_initial_positive_rate < 1:
+            raise ValueError("stop_initial_positive_rate must lie in (0,1)")
+        if not 0 < cfg.stop_threshold < 1:
+            raise ValueError("stop_threshold must lie in (0,1)")
+        if cfg.use_indoor_uav_progress_stop_head:
+            if cfg.stop_progress_projection_dim < 1:
+                raise ValueError("stop_progress_projection_dim must be positive")
+            if cfg.stop_progress_loss_weight < 0:
+                raise ValueError("stop_progress_loss_weight must be non-negative")
+    elif cfg.use_indoor_uav_progress_stop_head:
+        raise ValueError("progress STOP requires use_indoor_uav_stop_head=True")
     if cfg.num_action_branches < 1:
         raise ValueError("num_action_branches must be >= 1")
     if cfg.num_action_branches > 1 and not cfg.use_l1_regression:
@@ -2031,6 +3434,16 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("condition_alignment_weight must be >= 0")
     if cfg.condition_contrastive_weight < 0:
         raise ValueError("condition_contrastive_weight must be >= 0")
+    if cfg.condition_temporal_weight < 0:
+        raise ValueError("condition_temporal_weight must be >= 0")
+    if cfg.condition_queue_weight < 0:
+        raise ValueError("condition_queue_weight must be >= 0")
+    if cfg.condition_queue_size < 1:
+        raise ValueError("condition_queue_size must be >= 1")
+    if cfg.condition_queue_min_negatives < 1:
+        raise ValueError("condition_queue_min_negatives must be >= 1")
+    if (cfg.condition_temporal_weight > 0 or cfg.condition_queue_weight > 0) and not cfg.use_indoor_uav_condition_adapter:
+        raise ValueError("temporal and queue condition losses require use_indoor_uav_condition_adapter=True")
     if cfg.condition_contrastive_temperature <= 0:
         raise ValueError("condition_contrastive_temperature must be > 0")
     if not 0 <= cfg.condition_loss_start_time_index < NUM_ACTIONS_CHUNK:
@@ -2046,17 +3459,22 @@ def finetune(cfg: FinetuneConfig) -> None:
             "couple_condition_to_action_branch requires use_cond_action_tokens "
             "and use_best_of_k_action_loss"
         )
-    if cfg.condition_contrastive_weight > 0 and not cfg.couple_condition_to_action_branch:
+    k1_condition_sft = cfg.use_indoor_uav_condition_adapter and cfg.num_action_branches == 1
+    if (
+        cfg.condition_contrastive_weight > 0
+        and not cfg.couple_condition_to_action_branch
+        and not k1_condition_sft
+    ):
         raise ValueError(
             "condition_contrastive_weight > 0 requires couple_condition_to_action_branch=True"
         )
     if cfg.condition_assignment_weight > 0 and (
-        not cfg.use_gaussian_action_head
-        or not cfg.use_best_of_k_action_loss
+        not cfg.use_best_of_k_action_loss
         or not cfg.couple_condition_to_action_branch
+        or not (cfg.use_gaussian_action_head or cfg.use_indoor_uav_condition_adapter)
     ):
         raise ValueError(
-            "condition_assignment_weight > 0 requires Gaussian best-of-K with coupled condition-action branches"
+            "condition_assignment_weight > 0 requires coupled Gaussian or IndoorUAV Best-of-K branches"
         )
     if cfg.condition_assignment_weight > 0 and (
         cfg.condition_alignment_weight <= 0 and cfg.condition_contrastive_weight <= 0
@@ -2090,6 +3508,73 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("grpo_advantage_clip must be > 0")
     if cfg.max_grad_norm is not None and cfg.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be > 0 when provided")
+    if cfg.root_action_weight < 0 or cfg.future_action_weight < 0:
+        raise ValueError("root_action_weight and future_action_weight must be >= 0")
+    if cfg.condition_match_dim < 1 or cfg.condition_match_hidden_dim < 1:
+        raise ValueError("condition matching dimensions must be positive")
+    if cfg.relative_action_targets and cfg.body_delta_action_targets:
+        raise ValueError("relative_action_targets and body_delta_action_targets are mutually exclusive")
+
+    if cfg.use_indoor_uav_condition_adapter:
+        required_flags = {
+            "use_l1_regression": cfg.use_l1_regression,
+            "use_cond_action_tokens": cfg.use_cond_action_tokens,
+            "use_reference_previous_current": cfg.use_reference_previous_current,
+            "body_delta_action_targets": cfg.body_delta_action_targets,
+            "cyclic_yaw_proprio": cfg.cyclic_yaw_proprio,
+            "use_proprio": cfg.use_proprio,
+        }
+        missing = [name for name, enabled in required_flags.items() if not enabled]
+        if missing:
+            raise ValueError(f"IndoorUAV condition SFT requires: {', '.join(missing)}")
+        if cfg.num_action_branches > 1 and not (
+            cfg.use_best_of_k_action_loss and cfg.couple_condition_to_action_branch
+        ):
+            raise ValueError("multi-branch IndoorUAV condition SFT requires coupled Best-of-K assignment")
+        if cfg.condition_assignment_weight != 0:
+            raise ValueError(
+                "IndoorUAV K-way condition labels must use action-only branch assignment; "
+                "set condition_assignment_weight=0"
+            )
+        if cfg.num_action_branches == 1 and cfg.condition_contrastive_weight > 0:
+            raise ValueError("K-way condition contrastive loss requires num_action_branches > 1")
+        if cfg.use_diffusion or cfg.use_gaussian_action_head or cfg.grpo_reward_weight > 0:
+            raise ValueError(
+                "IndoorUAV condition training is deterministic SFT; "
+                "diffusion, Gaussian, and GRPO are disabled"
+            )
+        if cfg.num_images_in_input != 3:
+            raise ValueError("IndoorUAV condition SFT requires exactly [reference, previous, current] images")
+        if cfg.future_action_stride != 1:
+            raise ValueError("one-step body-delta supervision requires future_action_stride=1")
+        if cfg.initial_action_branch_index != 0:
+            raise ValueError("slot 0 is supervised and executed only through branch 0")
+        if cfg.condition_loss_start_time_index != 1:
+            raise ValueError("future visual conditions start at slot 1")
+        if NUM_ACTIONS_CHUNK != 5 or ACTION_DIM != 4 or PROPRIO_DIM != 4:
+            raise ValueError("IndoorUAV condition SFT requires T=5 and 4D source pose/action constants")
+        if not cfg.reset_proprio_projector and not cfg.resume and auxiliary_path_set:
+            auxiliary_contract_path = Path(cfg.auxiliary_init_checkpoint_path) / "policy_contract.json"
+            if not auxiliary_contract_path.is_file():
+                raise ValueError(
+                    "loading a cyclic proprio projector requires an auxiliary policy_contract.json"
+                )
+            with auxiliary_contract_path.open("r", encoding="utf-8") as contract_file:
+                auxiliary_contract = json.load(contract_file)
+            expected_auxiliary_contract = {
+                "model_proprio_dim": 5,
+                "proprio_representation": "xyz_sin_yaw_cos_yaw_v1",
+                "action_representation": "body_delta_one_step_v1",
+                "horizon": NUM_ACTIONS_CHUNK,
+                "num_action_branches": cfg.num_action_branches,
+            }
+            mismatches = {
+                key: (auxiliary_contract.get(key), expected)
+                for key, expected in expected_auxiliary_contract.items()
+                if auxiliary_contract.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError(f"incompatible auxiliary IndoorUAV policy contract: {mismatches}")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -2123,6 +3608,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
         f"\tACTION_DIM: {ACTION_DIM}\n"
         f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
+        f"\tMODEL_PROPRIO_DIM: {get_model_proprio_dim(cfg)}\n"
         f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
     )
 
@@ -2211,7 +3697,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             "proprio_projector",
             cfg,
             device_id,
-            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            {"llm_dim": vla.module.llm_dim, "proprio_dim": get_model_proprio_dim(cfg)},
         )
 
     # If applicable, instantiate continuous action head for L1 regression
@@ -2243,6 +3729,56 @@ def finetune(cfg: FinetuneConfig) -> None:
             device_id,
             action_head_args,
             to_bf16=True,
+        )
+
+    condition_adapter = None
+    if cfg.use_indoor_uav_condition_adapter:
+        _set_torch_seed(cfg.seed + 3, "condition-adapter initialization")
+        condition_adapter = init_module(
+            IndoorUAVConditionAdapter,
+            "condition_adapter",
+            cfg,
+            device_id,
+            {
+                "llm_dim": vla.module.llm_dim,
+                "hidden_dim": cfg.condition_match_hidden_dim,
+                "match_dim": cfg.condition_match_dim,
+            },
+            allow_missing_auxiliary=True,
+        )
+
+    stop_head = None
+    if cfg.use_indoor_uav_stop_head:
+        _set_torch_seed(cfg.seed + 4, "stop-head initialization")
+        stop_head_class = (
+            IndoorUAVProgressStopHead
+            if cfg.use_indoor_uav_progress_stop_head
+            else IndoorUAVStopHead
+        )
+        stop_head_args = (
+            {
+                "input_dim": vla.module.llm_dim,
+                "projection_dim": cfg.stop_progress_projection_dim,
+                "hidden_dim": cfg.stop_head_hidden_dim,
+                "initial_positive_rates": tuple(
+                    min(0.95, cfg.stop_initial_positive_rate * (horizon + 1))
+                    for horizon in STOP_PROGRESS_HORIZONS
+                ),
+            }
+            if cfg.use_indoor_uav_progress_stop_head
+            else {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": cfg.stop_head_hidden_dim,
+                "initial_positive_rate": cfg.stop_initial_positive_rate,
+            }
+        )
+        stop_head = init_module(
+            stop_head_class,
+            "stop_head",
+            cfg,
+            device_id,
+            stop_head_args,
+            allow_missing_auxiliary=True,
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -2279,6 +3815,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.freeze_proprio_projector:
         set_module_trainable(proprio_projector if cfg.use_proprio else None, False)
         print("[Training] Frozen proprio projector")
+    if cfg.freeze_action_head:
+        set_module_trainable(action_head if cfg.use_l1_regression else None, False)
+        print("[Training] Frozen action head")
+    if cfg.freeze_condition_adapter:
+        set_module_trainable(condition_adapter, False)
+        print("[Training] Frozen condition adapter")
 
     # Instantiate optimizer 收集所有可训练参数
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -2288,6 +3830,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if condition_adapter is not None:
+        trainable_params += [param for param in condition_adapter.parameters() if param.requires_grad]
+    if stop_head is not None:
+        trainable_params += [param for param in stop_head.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -2326,10 +3872,19 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("future_action_stride must be >= 1")
     if cfg.relative_action_targets and (not cfg.use_proprio or ACTION_DIM != 4 or PROPRIO_DIM != 4):
         raise ValueError("relative_action_targets requires 4D UAV action/proprio and use_proprio=True")
+    if cfg.body_delta_action_targets and (not cfg.use_proprio or ACTION_DIM != 4 or PROPRIO_DIM != 4):
+        raise ValueError("body_delta_action_targets requires 4D UAV action/proprio and use_proprio=True")
 
-    # Multi-image IndoorUAV uses primary-camera history, not wrist cameras.
-    use_wrist_image = cfg.num_images_in_input > 1 and not cfg.use_image_history
-    window_size = cfg.num_images_in_input if cfg.use_image_history else 1
+    # The condition policy uses two dynamic frames; the third image is the
+    # episode reference and therefore must not enlarge the temporal window.
+    use_wrist_image = (
+        cfg.num_images_in_input > 1
+        and not cfg.use_image_history
+        and not cfg.use_reference_previous_current
+    )
+    window_size = 2 if cfg.use_reference_previous_current else (
+        cfg.num_images_in_input if cfg.use_image_history else 1
+    )
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
@@ -2346,13 +3901,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         load_future_images=(
             cfg.use_cond_action_tokens
             and (
-                cfg.condition_alignment_weight > 0
+                cfg.use_indoor_uav_condition_adapter
+                or cfg.condition_alignment_weight > 0
                 or cfg.condition_contrastive_weight > 0
+                or cfg.condition_temporal_weight > 0
+                or cfg.condition_queue_weight > 0
                 or cfg.condition_diversity_weight > 0
                 or cfg.condition_assignment_weight > 0
             )
         ),
         num_action_branches=cfg.num_action_branches,
+        use_reference_previous_current=cfg.use_reference_previous_current,
+        body_delta_action_targets=cfg.body_delta_action_targets,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -2361,10 +3921,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        tfds_split=cfg.train_tfds_split,
         window_size=window_size,
         relative_action_targets=cfg.relative_action_targets,
         future_action_stride=cfg.future_action_stride,
         relative_action_wrap_yaw=cfg.relative_action_wrap_yaw,
+        body_delta_action_targets=cfg.body_delta_action_targets,
+        cyclic_yaw_proprio=cfg.cyclic_yaw_proprio,
+        use_reference_previous_current=cfg.use_reference_previous_current,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -2373,18 +3937,55 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
-            image_aug=cfg.image_aug,
+            image_aug=False,
+            tfds_split=cfg.val_tfds_split,
             train=False,
             window_size=window_size,
             relative_action_targets=cfg.relative_action_targets,
             future_action_stride=cfg.future_action_stride,
             relative_action_wrap_yaw=cfg.relative_action_wrap_yaw,
+            body_delta_action_targets=cfg.body_delta_action_targets,
+            cyclic_yaw_proprio=cfg.cyclic_yaw_proprio,
+            use_reference_previous_current=cfg.use_reference_previous_current,
         )
+
+    if cfg.use_indoor_uav_stop_head and cfg.stop_positive_weight == 0:
+        stop_stats = train_dataset.dataset_statistics[cfg.dataset_name]
+        num_transitions = float(stop_stats["num_transitions"])
+        num_trajectories = float(stop_stats["num_trajectories"])
+        if not 0 < num_trajectories < num_transitions:
+            raise ValueError("invalid transition/trajectory counts for STOP class balancing")
+        cfg.stop_positive_weight = (num_transitions - num_trajectories) / num_trajectories
+    cfg.stop_progress_positive_weights = None
+    if cfg.use_indoor_uav_progress_stop_head:
+        stop_stats = train_dataset.dataset_statistics[cfg.dataset_name]
+        num_transitions = float(stop_stats["num_transitions"])
+        num_trajectories = float(stop_stats["num_trajectories"])
+        positive_counts = [
+            min(num_transitions, (horizon + 1) * num_trajectories)
+            for horizon in STOP_PROGRESS_HORIZONS
+        ]
+        cfg.stop_progress_positive_weights = tuple(
+            (num_transitions - count) / count for count in positive_counts
+        )
+    if cfg.use_indoor_uav_stop_head:
+        print(
+            "[STOP] target=terminate after root action, "
+            f"positive_weight={cfg.stop_positive_weight:.6f}, "
+            f"loss_weight={cfg.stop_loss_weight:.6f}, threshold={cfg.stop_threshold:.3f}"
+        )
+        if cfg.use_indoor_uav_progress_stop_head:
+            print(
+                f"[STOP] progress_horizons={STOP_PROGRESS_HORIZONS}, "
+                f"progress_positive_weights={cfg.stop_progress_positive_weights}, "
+                f"progress_loss_weight={cfg.stop_progress_loss_weight:.6f}"
+            )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
         _print_dataset_statistics(train_dataset.dataset_statistics)
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
+        save_policy_contract(cfg, train_dataset.dataset_statistics, run_dir)
     action_norm_stats = _get_action_norm_stats(train_dataset.dataset_statistics, cfg.dataset_name)
     if cfg.use_cond_action_tokens:
         cond_token_ids, act_token_ids = get_cond_action_token_id_tensors(
@@ -2417,6 +4018,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_probability_mean": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_target_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_predicted_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_progress_aux_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "stop_progress_total_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
@@ -2426,6 +4033,27 @@ def finetune(cfg: FinetuneConfig) -> None:
         "best_of_k_time_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_of_k_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "best_of_k_gaussian_nll": deque(maxlen=cfg.grad_accumulation_steps),
+        "sft_root_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "sft_future_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_branch_pair_l1": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_branch_min_pair_l1": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_branch_position_separation_m": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_branch_yaw_separation_rad": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_winner_gap": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_winner_near_tie_rate": deque(maxlen=cfg.grad_accumulation_steps),
+        "oracle_future_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_selected_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch0_future_action_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_selection_regret": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_gain_vs_branch0": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_oracle_recovery": deque(maxlen=cfg.grad_accumulation_steps),
+        "oracle_action_position_error_m": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_selected_position_error_m": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch0_position_error_m": deque(maxlen=cfg.grad_accumulation_steps),
+        "oracle_action_yaw_error_rad": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_selected_yaw_error_rad": deque(maxlen=cfg.grad_accumulation_steps),
+        "branch0_yaw_error_rad": deque(maxlen=cfg.grad_accumulation_steps),
+        "plan_valid_ratio": deque(maxlen=cfg.grad_accumulation_steps),
         "gaussian_nll_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "gaussian_log_std_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "gaussian_log_std_min": deque(maxlen=cfg.grad_accumulation_steps),
@@ -2478,17 +4106,48 @@ def finetune(cfg: FinetuneConfig) -> None:
         "condition_patch_centered_norm_mean": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_alignment_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_contrastive_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_branch_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_branch_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_temporal_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_retrieval_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_retrieval_positive": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_retrieval_hardest_negative": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_retrieval_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_queries": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_negatives": deque(maxlen=cfg.grad_accumulation_steps),
+        "condition_queue_size": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_contrastive_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_contrastive_margin": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_diversity_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "condition_mean_distance": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    for horizon in STOP_PROGRESS_HORIZONS:
+        for suffix in ("probability_mean", "target_rate", "accuracy"):
+            recent_metrics[f"stop_progress_h{horizon}_{suffix}"] = deque(
+                maxlen=cfg.grad_accumulation_steps
+            )
+        if horizon > 0:
+            recent_metrics[f"stop_progress_h{horizon}_loss"] = deque(
+                maxlen=cfg.grad_accumulation_steps
+            )
+    for axis_name in ("forward", "right", "up", "yaw"):
+        for suffix in ("prediction_mean", "target_mean", "bias", "abs_error", "sign_accuracy"):
+            recent_metrics[f"root_{axis_name}_{suffix}"] = deque(
+                maxlen=cfg.grad_accumulation_steps
+            )
     for branch_idx in range(cfg.num_action_branches):
         recent_metrics.setdefault(
             f"branch{branch_idx}_winner_rate", deque(maxlen=cfg.grad_accumulation_steps)
         )
         recent_metrics.setdefault(
             f"branch{branch_idx}_soft_usage", deque(maxlen=cfg.grad_accumulation_steps)
+        )
+        recent_metrics.setdefault(
+            f"condition_branch{branch_idx}_selected_rate",
+            deque(maxlen=cfg.grad_accumulation_steps),
         )
         recent_metrics.setdefault(
             f"offline_branch{branch_idx}_reward", deque(maxlen=cfg.grad_accumulation_steps)
@@ -2501,6 +4160,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start training 真正开始训练（核心）
     fixed_overfit_batches = []
     overfit_loss_window = deque(maxlen=max(cfg.overfit_fixed_batch_count, 1))
+    training_condition_queue = (
+        CrossEpisodeImageQueue(cfg.condition_queue_size)
+        if condition_adapter is not None and cfg.condition_queue_weight > 0
+        else None
+    )
     if cfg.overfit_fixed_batch_count > 0 and distributed_state.is_main_process:
         print(
             "[Overfit diagnostic] Repeating the first "
@@ -2514,7 +4178,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         if cfg.use_proprio and cfg.freeze_proprio_projector:
             proprio_projector.eval()
         if cfg.use_l1_regression or cfg.use_diffusion:
-            action_head.train()
+            action_head.eval() if cfg.freeze_action_head else action_head.train()
+        if condition_adapter is not None:
+            condition_adapter.eval() if cfg.freeze_condition_adapter else condition_adapter.train()
+        if stop_head is not None:
+            stop_head.train()
         optimizer.zero_grad()
         for batch_idx, incoming_batch in enumerate(dataloader):
             batch = select_overfit_batch(
@@ -2528,6 +4196,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                condition_adapter=condition_adapter,
+                stop_head=stop_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
                 batch=batch,
@@ -2563,11 +4233,23 @@ def finetune(cfg: FinetuneConfig) -> None:
                 condition_similarity_threshold=cfg.condition_similarity_threshold,
                 condition_alignment_weight=cfg.condition_alignment_weight,
                 condition_contrastive_weight=cfg.condition_contrastive_weight,
+                condition_temporal_weight=cfg.condition_temporal_weight,
+                condition_queue_weight=cfg.condition_queue_weight,
+                condition_queue_min_negatives=cfg.condition_queue_min_negatives,
+                condition_negative_queue=training_condition_queue,
                 condition_contrastive_temperature=cfg.condition_contrastive_temperature,
                 condition_loss_start_time_index=cfg.condition_loss_start_time_index,
                 condition_patch_topk=cfg.condition_patch_topk,
                 condition_diversity_weight=cfg.condition_diversity_weight,
                 condition_diversity_margin=cfg.condition_diversity_margin,
+                root_action_weight=cfg.root_action_weight,
+                future_action_weight=cfg.future_action_weight,
+                stop_loss_weight=cfg.stop_loss_weight,
+                stop_positive_weight=cfg.stop_positive_weight,
+                stop_threshold=cfg.stop_threshold,
+                use_progress_stop_head=cfg.use_indoor_uav_progress_stop_head,
+                stop_progress_positive_weights=cfg.stop_progress_positive_weights,
+                stop_progress_loss_weight=cfg.stop_progress_loss_weight,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 debug_batch_shapes=cfg.debug_batch_shapes and batch_idx < cfg.debug_num_batches,
@@ -2601,7 +4283,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             if cfg.debug_grad_norm and distributed_state.is_main_process and batch_idx < cfg.debug_num_batches:
                 grad_norms = {
                     "vla": _module_grad_norm(vla),
-                    "action_head": _module_grad_norm(action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None),
+                    "action_head": _module_grad_norm(
+                        action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None
+                    ),
+                    "condition_adapter": _module_grad_norm(condition_adapter),
+                    "stop_head": _module_grad_norm(stop_head),
                     "proprio_projector": _module_grad_norm(proprio_projector if cfg.use_proprio else None),
                     "noisy_action_projector": _module_grad_norm(noisy_action_projector if cfg.use_diffusion else None),
                 }
@@ -2626,46 +4312,122 @@ def finetune(cfg: FinetuneConfig) -> None:
             ):
                 overfit_step = gradient_step_idx + 1
                 if overfit_step == 1 or overfit_step % cfg.overfit_report_freq == 0:
+                    diagnostic_names = (
+                        "stop_loss",
+                        "stop_probability_mean",
+                        "stop_target_rate",
+                        "stop_predicted_rate",
+                        "stop_progress_aux_loss",
+                        "stop_progress_total_loss",
+                        "sft_root_action_loss",
+                        "sft_future_action_loss",
+                        "condition_alignment_loss",
+                        "condition_contrastive_loss",
+                        "condition_branch_accuracy",
+                        "condition_branch_margin",
+                        "condition_temporal_loss",
+                        "condition_retrieval_accuracy",
+                        "condition_retrieval_margin",
+                        "condition_queue_loss",
+                        "condition_queue_accuracy",
+                        "condition_queue_margin",
+                        "condition_similarity_selected",
+                    ) + tuple(
+                        metric_name
+                        for branch_idx in range(cfg.num_action_branches)
+                        for metric_name in (
+                            f"branch{branch_idx}_winner_rate",
+                            f"branch{branch_idx}_soft_usage",
+                        )
+                    )
+                    diagnostic_values = " ".join(
+                        f"{name}={sum(recent_metrics[name]) / len(recent_metrics[name]):.6f}"
+                        for name in diagnostic_names
+                        if recent_metrics.get(name)
+                    )
                     print(
                         f"[Overfit diagnostic] step={overfit_step} "
                         f"cached_batches={len(fixed_overfit_batches)} "
-                        f"recent_mean_loss={sum(overfit_loss_window) / len(overfit_loss_window):.6f}"
+                        f"recent_mean_loss={sum(overfit_loss_window) / len(overfit_loss_window):.6f} "
+                        f"{diagnostic_values}"
                     )
 
-            # Compute smoothened train metrics
-            smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+            log_step = completed_optimizer_step(
+                batch_idx,
+                cfg.grad_accumulation_steps,
+                cfg.resume_step if cfg.resume else 0,
+            )
+            if log_step is None:
+                continue
 
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
-
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+            # Apply warmup once per optimizer step, immediately before updating parameters.
             if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                lr_progress = min(log_step / cfg.lr_warmup_steps, 1.0)
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
 
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            progress.update()
+
+            # Log/save/validate exactly once per completed optimizer step.
+            smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
                 wandb.log(
-                    {
-                        "VLA Train/Learning Rate": optimizer.param_groups[0]["lr"],
-                    },
+                    {"VLA Train/Learning Rate": optimizer.param_groups[0]["lr"]},
                     step=log_step,
                 )
-
-            # Optimizer and LR scheduler step 真正更新参数
-            if gradient_step_boundary:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                progress.update()
+            if distributed_state.is_main_process and (
+                log_step == 1 or log_step % cfg.train_report_freq == 0
+            ):
+                report_keys = (
+                    "loss_value",
+                    "stop_loss",
+                    "stop_probability_mean",
+                    "stop_target_rate",
+                    "stop_predicted_rate",
+                    "stop_progress_aux_loss",
+                    "stop_progress_total_loss",
+                    "sft_root_action_loss",
+                    "sft_future_action_loss",
+                    "root_forward_bias",
+                    "root_right_bias",
+                    "root_up_bias",
+                    "root_yaw_bias",
+                    "condition_selected_action_loss",
+                    "branch0_future_action_loss",
+                    "condition_selection_regret",
+                    "condition_gain_vs_branch0",
+                    "condition_oracle_recovery",
+                    "condition_contrastive_loss",
+                    "condition_branch_accuracy",
+                    "condition_branch_margin",
+                    "condition_temporal_loss",
+                    "condition_retrieval_accuracy",
+                    "condition_retrieval_margin",
+                    "condition_queue_loss",
+                    "condition_queue_accuracy",
+                    "condition_queue_margin",
+                    "condition_queue_queries",
+                    "condition_queue_negatives",
+                    "condition_queue_size",
+                    "branch0_soft_usage",
+                    "branch1_soft_usage",
+                    "branch2_soft_usage",
+                    "gradient_norm_before_clip",
+                )
+                report = ", ".join(
+                    f"{key}={smoothened_metrics[key]:.6f}"
+                    for key in report_keys
+                    if key in smoothened_metrics
+                )
+                print(f"[Train] step={log_step}, lr={optimizer.param_groups[0]['lr']:.8f}, {report}")
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if log_step % cfg.save_freq == 0:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -2675,15 +4437,19 @@ def finetune(cfg: FinetuneConfig) -> None:
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    condition_adapter=condition_adapter,
+                    stop_head=stop_head,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
 
             # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+            if cfg.use_val_set and log_step % cfg.val_freq == 0:
                 run_validation(
                     vla=vla,
                     action_head=action_head,
+                    condition_adapter=condition_adapter,
+                    stop_head=stop_head,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     val_dataloader=val_dataloader,
@@ -2697,12 +4463,22 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_norm_stats=action_norm_stats,
                     cond_token_ids=cond_token_ids,
                     act_token_ids=act_token_ids,
+                    run_dir=run_dir,
                 )
-                # Set model back to training mode after validation
-                vla.train()
+                # Restore the exact modes used by the optimizer.  A frozen VLA
+                # must stay in eval mode so dropout cannot move STOP features.
+                vla.eval() if cfg.freeze_vla else vla.train()
+                if cfg.use_proprio:
+                    proprio_projector.eval() if cfg.freeze_proprio_projector else proprio_projector.train()
+                if cfg.use_l1_regression or cfg.use_diffusion:
+                    action_head.eval() if cfg.freeze_action_head else action_head.train()
+                if condition_adapter is not None:
+                    condition_adapter.eval() if cfg.freeze_condition_adapter else condition_adapter.train()
+                if stop_head is not None:
+                    stop_head.train()
 
             # Stop training when max_steps is reached
-            if log_step == cfg.max_steps:
+            if log_step >= cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
 

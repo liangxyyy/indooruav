@@ -106,6 +106,10 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        if "episode_id" in instances[0]:
+            episode_ids = [instance["episode_id"] for instance in instances]
+        else:
+            episode_ids = None
         if "image_history_pad_mask" in instances[0]:
             image_history_pad_mask = torch.tensor(
                 np.stack([instance["image_history_pad_mask"] for instance in instances]),
@@ -113,10 +117,40 @@ class PaddedCollatorForActionPrediction:
             )
         else:
             image_history_pad_mask = None
+        if "image_valid_mask" in instances[0]:
+            image_valid_mask = torch.tensor(
+                np.stack([instance["image_valid_mask"] for instance in instances]),
+                dtype=torch.bool,
+            )
+        else:
+            image_valid_mask = None
+        if "plan_valid_mask" in instances[0]:
+            plan_valid_mask = torch.tensor(
+                np.stack([instance["plan_valid_mask"] for instance in instances]),
+                dtype=torch.bool,
+            )
+        else:
+            plan_valid_mask = None
         if "future_pixel_values" in instances[0]:
             future_pixel_values = torch.stack([instance["future_pixel_values"] for instance in instances])
         else:
             future_pixel_values = None
+        stop_after_action = (
+            torch.as_tensor(
+                np.stack([instance["stop_after_action"] for instance in instances]),
+                dtype=torch.float32,
+            ).reshape(len(instances))
+            if "stop_after_action" in instances[0]
+            else None
+        )
+        actions_remaining_after_root = (
+            torch.as_tensor(
+                np.stack([instance["actions_remaining_after_root"] for instance in instances]),
+                dtype=torch.long,
+            ).reshape(len(instances))
+            if "actions_remaining_after_root" in instances[0]
+            else None
+        )
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -150,7 +184,7 @@ class PaddedCollatorForActionPrediction:
         # Stack proprio
         if "proprio" in instances[0]:
             proprio = [instance["proprio"] for instance in instances]
-            proprio = torch.Tensor(np.squeeze(np.stack(proprio)))
+            proprio = torch.as_tensor(np.stack(proprio), dtype=torch.float32).reshape(len(instances), -1)
         else:
             proprio = None
 
@@ -164,8 +198,18 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if episode_ids is not None:
+            output["episode_ids"] = episode_ids
         if image_history_pad_mask is not None:
             output["image_history_pad_mask"] = image_history_pad_mask
+        if image_valid_mask is not None:
+            output["image_valid_mask"] = image_valid_mask
+        if plan_valid_mask is not None:
+            output["plan_valid_mask"] = plan_valid_mask
         if future_pixel_values is not None:
             output["future_pixel_values"] = future_pixel_values
+        if stop_after_action is not None:
+            output["stop_after_action"] = stop_after_action
+        if actions_remaining_after_root is not None:
+            output["actions_remaining_after_root"] = actions_remaining_after_root
         return output

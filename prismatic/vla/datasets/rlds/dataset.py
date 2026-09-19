@@ -41,6 +41,7 @@ def make_dataset_from_rlds(
     data_dir: str,
     *,
     train: bool,
+    tfds_split: Optional[str] = None,
     standardize_fn: Optional[Callable[[dict], dict]] = None,
     shuffle: bool = True,
     image_obs_keys: Dict[str, Optional[str]] = {},
@@ -55,6 +56,8 @@ def make_dataset_from_rlds(
     relative_action_horizon: int = 1,
     relative_action_stride: int = 1,
     relative_action_wrap_yaw: bool = False,
+    body_delta_action_targets: bool = False,
+    cyclic_yaw_proprio: bool = False,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -84,7 +87,9 @@ def make_dataset_from_rlds(
     Args:
         name (str): The name of the RLDS dataset (usually "name" or "name:version").
         data_dir (str): The path to the data directory.
-        train (bool): Whether to use the training or validation split.
+        train (bool): Whether transforms should run in training or validation mode.
+        tfds_split (str, optional): Explicit TFDS split instruction. When omitted,
+            defaults to ``train`` for training and ``val`` for validation.
         shuffle (bool, optional): Whether to shuffle the file read order (does NOT fully shuffle the dataset, since one
             file usually contains many trajectories)!
         standardize_fn (Callable[[dict], dict], optional): A function that, if provided, will be the first
@@ -142,6 +147,31 @@ def make_dataset_from_rlds(
                 f"Trajectory is missing keys: {REQUIRED_KEYS - set(traj.keys())}. " "Did you write a `standardize_fn`?"
             )
 
+        # Preserve the RLDS source path as a stable episode identifier. It is
+        # optional for generic OXE datasets, but IndoorUAV uses it to keep
+        # same-trajectory windows out of the cross-episode negative queue.
+        episode_ids = None
+        traj_metadata = traj.get("traj_metadata", {})
+        episode_metadata = traj_metadata.get("episode_metadata", {})
+        if "file_path" in episode_metadata:
+            # dlimp has already broadcast episode metadata to trajectory length.
+            episode_ids = episode_metadata["file_path"]
+        elif "_traj_index" in traj:
+            # Generic RLDS fallback when no stable source path was stored.
+            episode_ids = tf.strings.as_string(traj["_traj_index"])
+
+        # IndoorUAV's final RLDS step still contains a valid action from the
+        # last observation to the instruction endpoint.  The label therefore
+        # means "stop after executing this action", not "replace it by zero".
+        if "is_terminal" in traj:
+            stop_after_action = tf.cast(traj["is_terminal"], tf.bool)
+        elif "is_last" in traj:
+            stop_after_action = tf.cast(traj["is_last"], tf.bool)
+        else:
+            stop_after_action = tf.range(tf.shape(traj["action"])[0]) == (
+                tf.shape(traj["action"])[0] - 1
+            )
+
         # extracts images, depth images and proprio from the "observation" dict
         traj_len = tf.shape(traj["action"])[0]
         old_obs = traj["observation"]
@@ -189,6 +219,9 @@ def make_dataset_from_rlds(
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
         }
+        if episode_ids is not None:
+            traj["episode_id"] = episode_ids
+        traj["stop_after_action"] = stop_after_action
 
         if absolute_action_mask is not None:
             if len(absolute_action_mask) != traj["action"].shape[-1]:
@@ -203,22 +236,51 @@ def make_dataset_from_rlds(
 
         return traj
 
-    if relative_action_targets:
+    def restructure_for_statistics(traj):
+        """Extract only numeric fields so statistics never decode unused RGB/depth payloads."""
+        if standardize_fn is not None:
+            traj = standardize_fn(traj)
+        traj_len = tf.shape(traj["action"])[0]
+        observation = {}
+        if state_obs_keys:
+            observation["proprio"] = tf.concat(
+                [
+                    tf.zeros((traj_len, 1), dtype=tf.float32)
+                    if key is None
+                    else tf.cast(traj["observation"][key], tf.float32)
+                    for key in state_obs_keys
+                ],
+                axis=1,
+            )
+        return {
+            "observation": observation,
+            "action": tf.cast(traj["action"], tf.float32),
+        }
+
+    if relative_action_targets and body_delta_action_targets:
+        raise ValueError("relative_action_targets and body_delta_action_targets are mutually exclusive")
+    if cyclic_yaw_proprio and not body_delta_action_targets:
+        raise ValueError("cyclic_yaw_proprio currently requires body_delta_action_targets=True")
+    transformed_action_targets = relative_action_targets or body_delta_action_targets
+    if transformed_action_targets:
         if not state_obs_keys:
-            raise ValueError("relative_action_targets requires proprio observations")
+            raise ValueError("transformed action targets require proprio observations")
         if relative_action_horizon < 1 or relative_action_stride < 1:
-            raise ValueError("relative_action_horizon and relative_action_stride must both be >= 1")
+            raise ValueError("action horizon and stride must both be >= 1")
+        if body_delta_action_targets and relative_action_stride != 1:
+            raise ValueError("body_delta_one_step_v1 requires relative_action_stride=1")
 
     builder = tfds.builder(name, data_dir=data_dir)
 
     # load or compute dataset statistics
+    statistics_were_provided = dataset_statistics is not None
     if isinstance(dataset_statistics, str):
         with tf.io.gfile.GFile(dataset_statistics, "r") as f:
             dataset_statistics = json.load(f)
     elif dataset_statistics is None:
         full_dataset = dl.DLataset.from_rlds(
             builder, split="all", shuffle=False, num_parallel_reads=num_parallel_reads
-        ).traj_map(restructure, num_parallel_calls)
+        ).traj_map(restructure_for_statistics, num_parallel_calls)
         # tries to load from cache, otherwise computes on the fly
         dataset_statistics = get_dataset_statistics(
             full_dataset,
@@ -229,37 +291,102 @@ def make_dataset_from_rlds(
             ),
             save_dir=builder.data_dir,
         )
-        if relative_action_targets:
-            relative_statistics_dataset = full_dataset.traj_map(
-                partial(
+        if transformed_action_targets:
+            if body_delta_action_targets:
+                action_statistics_transform = partial(
+                    traj_transforms.body_delta_action_statistics_trajectory,
+                    cyclic_yaw_proprio=cyclic_yaw_proprio,
+                )
+                representation_dependencies = (
+                    "body_delta_one_step_v1",
+                    "cyclic_yaw_proprio_v1" if cyclic_yaw_proprio else "scalar_yaw_proprio_v1",
+                    inspect.getsource(traj_transforms.world_pose_pair_to_body_delta),
+                    inspect.getsource(traj_transforms.pose_to_cyclic_proprio),
+                    inspect.getsource(traj_transforms.body_delta_action_statistics_trajectory),
+                )
+            else:
+                action_statistics_transform = partial(
                     traj_transforms.relative_action_statistics_trajectory,
                     horizon=relative_action_horizon,
                     stride=relative_action_stride,
                     wrap_yaw=relative_action_wrap_yaw,
-                ),
-                num_parallel_calls,
-            )
-            relative_statistics = get_dataset_statistics(
-                relative_statistics_dataset,
-                hash_dependencies=(
-                    str(builder.info),
-                    str(state_obs_keys),
-                    inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                )
+                representation_dependencies = (
                     "relative_plan_origin",
                     str(relative_action_horizon),
                     str(relative_action_stride),
                     str(relative_action_wrap_yaw),
                     inspect.getsource(traj_transforms.relative_action_statistics_trajectory),
+                )
+            transformed_statistics_dataset = full_dataset.traj_map(
+                action_statistics_transform,
+                num_parallel_calls,
+            )
+            transformed_statistics = get_dataset_statistics(
+                transformed_statistics_dataset,
+                hash_dependencies=(
+                    str(builder.info),
+                    str(state_obs_keys),
+                    inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                    *representation_dependencies,
                 ),
                 save_dir=builder.data_dir,
             )
-            dataset_statistics["action"] = relative_statistics["action"]
+            dataset_statistics["action"] = transformed_statistics["action"]
+            if body_delta_action_targets and cyclic_yaw_proprio:
+                dataset_statistics["proprio"] = transformed_statistics["proprio"]
+    if statistics_were_provided and body_delta_action_targets:
+        action_representation = dataset_statistics.get("action", {}).get("representation")
+        if str(action_representation) != "body_delta_one_step_v1":
+            raise ValueError(
+                "Explicit statistics for body_delta_action_targets must come from a saved Stage20 "
+                "dataset_statistics.json, not raw absolute-pose statistics"
+            )
+        if cyclic_yaw_proprio:
+            proprio_representation = dataset_statistics.get("proprio", {}).get("representation")
+            if str(proprio_representation) != "xyz_sin_yaw_cos_yaw_v1":
+                raise ValueError("Explicit Stage20 statistics must contain 5D cyclic proprio metadata")
+
     dataset_statistics = tree_map(np.array, dataset_statistics)
     if relative_action_targets:
         dataset_statistics["action"]["representation"] = np.array("relative_plan_origin")
         dataset_statistics["action"]["horizon"] = np.array(relative_action_horizon)
         dataset_statistics["action"]["stride"] = np.array(relative_action_stride)
         dataset_statistics["action"]["yaw_delta_wrapped"] = np.array(relative_action_wrap_yaw)
+    elif body_delta_action_targets:
+        dataset_statistics["action"]["representation"] = np.array("body_delta_one_step_v1")
+        dataset_statistics["action"]["source_action"] = np.array("absolute_next_world_pose")
+        dataset_statistics["action"]["axes"] = np.array(["forward", "right", "up", "yaw"])
+        dataset_statistics["action"]["yaw_zero_forward_world"] = np.array([0.0, -1.0, 0.0])
+        dataset_statistics["action"]["yaw_zero_right_world"] = np.array([1.0, 0.0, 0.0])
+        dataset_statistics["action"]["positive_yaw_turn"] = np.array("right")
+        dataset_statistics["action"]["negative_yaw_turn"] = np.array("left")
+        dataset_statistics["action"]["yaw_unit"] = np.array("radian")
+        dataset_statistics["action"]["yaw_delta_formula"] = np.array(
+            "((yaw_next-yaw_current+pi) mod (2*pi))-pi"
+        )
+        dataset_statistics["action"]["horizon"] = np.array(relative_action_horizon)
+        dataset_statistics["action"]["stride"] = np.array(relative_action_stride)
+        dataset_statistics["action"]["yaw_delta_wrapped"] = np.array(True)
+        dataset_statistics["action"]["coordinate_contract_version"] = np.array(1)
+        action_scale = np.maximum(
+            np.abs(dataset_statistics["action"]["min"]),
+            np.abs(dataset_statistics["action"]["max"]),
+        )
+        dataset_statistics["action"]["normalization_low"] = -action_scale
+        dataset_statistics["action"]["normalization_high"] = action_scale
+        dataset_statistics["action"]["normalization_representation"] = np.array(
+            "per_axis_symmetric_minmax_v1"
+        )
+        if cyclic_yaw_proprio:
+            proprio_low = np.asarray(dataset_statistics["proprio"]["q01"], dtype=np.float32).copy()
+            proprio_high = np.asarray(dataset_statistics["proprio"]["q99"], dtype=np.float32).copy()
+            proprio_low[-2:] = -1.0
+            proprio_high[-2:] = 1.0
+            dataset_statistics["proprio"]["normalization_low"] = proprio_low
+            dataset_statistics["proprio"]["normalization_high"] = proprio_high
+            dataset_statistics["proprio"]["representation"] = np.array("xyz_sin_yaw_cos_yaw_v1")
+            dataset_statistics["proprio"]["source_representation"] = np.array("xyz_yaw_radian")
 
     # skip normalization for certain action dimensions
     if action_normalization_mask is not None:
@@ -271,14 +398,14 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
 
     # construct the dataset
-    split = "train" if train else "val"
+    split = tfds_split or ("train" if train else "val")
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
     # Relative targets are constructed after temporal chunking. Their action and
     # proprio fields are normalized together at that point.
-    if not relative_action_targets:
+    if not transformed_action_targets:
         dataset = dataset.traj_map(
             partial(
                 normalize_action_and_proprio,
@@ -302,6 +429,9 @@ def apply_trajectory_transforms(
     future_action_stride: int = 1,
     relative_action_targets: bool = False,
     relative_action_wrap_yaw: bool = False,
+    body_delta_action_targets: bool = False,
+    cyclic_yaw_proprio: bool = False,
+    pad_future_horizon: bool = False,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -383,6 +513,8 @@ def apply_trajectory_transforms(
             future_action_window_size=future_action_window_size,
             future_action_stride=future_action_stride,
             relative_action_targets=relative_action_targets,
+            body_delta_action_targets=body_delta_action_targets,
+            pad_future_horizon=pad_future_horizon,
         ),
         num_parallel_calls,
     )
@@ -393,6 +525,20 @@ def apply_trajectory_transforms(
                 window_size=window_size,
                 wrap_yaw=relative_action_wrap_yaw,
             ),
+            num_parallel_calls,
+        )
+    elif body_delta_action_targets:
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.convert_action_chunks_to_body_delta,
+                window_size=window_size,
+            ),
+            num_parallel_calls,
+        )
+
+    if cyclic_yaw_proprio:
+        dataset = dataset.traj_map(
+            traj_transforms.convert_pose_observations_to_cyclic,
             num_parallel_calls,
         )
 
@@ -500,7 +646,9 @@ def make_single_dataset(
         train=train,
     )
     dataset = apply_trajectory_transforms(dataset, **traj_transform_kwargs, train=train)
-    if traj_transform_kwargs.get("relative_action_targets", False):
+    if traj_transform_kwargs.get("relative_action_targets", False) or traj_transform_kwargs.get(
+        "body_delta_action_targets", False
+    ):
         dataset = dataset.traj_map(
             partial(
                 normalize_action_and_proprio,
@@ -621,7 +769,9 @@ def make_interleaved_dataset(
             num_parallel_calls=threads,
             train=train,
         )
-        if traj_transform_kwargs.get("relative_action_targets", False):
+        if traj_transform_kwargs.get("relative_action_targets", False) or traj_transform_kwargs.get(
+            "body_delta_action_targets", False
+        ):
             dataset = dataset.traj_map(
                 partial(
                     normalize_action_and_proprio,

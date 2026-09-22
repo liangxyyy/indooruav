@@ -1641,3 +1641,95 @@ Stage21完全相同的固定1000-window、58-positive扩大审计。放行不能
 ROC-AUC和最佳balanced accuracy明显超过Stage21上限`0.6520/0.6753`，同时优先降低false
 positive；若仍需误停数百个non-terminal，则冻结特征路线失败，下一步才进入带动作保持约束的
 最小VLA LoRA解冻。
+
+#### Stage22 1k完成状态与扩大审计（2026-09-21更正）
+
+2026-09-19检查进程可见性时曾误判pilot在step 250保存后退出；随后根据完整checkpoint和验证文件
+确认该任务实际继续运行，并在16:44正常完成1000步。step 250/500/750/1000均保存了完整的
+schema-4 checkpoint及100-window快速验证结果，不能再把该pilot记为step-250中断。
+
+快速验证每次只有5个terminal正样本，结果只能用于链路检查：
+
+| checkpoint | ROC-AUC | best balanced accuracy | best threshold | FP / 95 | FN / 5 |
+|---:|---:|---:|---:|---:|---:|
+| 250 | 0.7937 | 0.7842 | 0.10038 | 22 | 1 |
+| 500 | 0.7642 | 0.7526 | 0.14501 | 28 | 1 |
+| 750 | 0.7726 | 0.7632 | 0.09988 | 26 | 1 |
+| 1000 | 0.8000 | 0.7842 | 0.13064 | 22 | 1 |
+
+为排除5个正样本造成的高方差，2026-09-21将四个checkpoint分别放到GPU 0/1/2/3，并行运行
+同一固定1000-window扩大审计；这是四个独立的只读评估，不是一个四卡训练任务：
+
+```text
+GPU 0 -> step 250 audit
+GPU 1 -> step 500 audit
+GPU 2 -> step 750 audit
+GPU 3 -> step 1000 audit
+```
+
+所有audit均以learning rate 0恢复checkpoint，只计算指标，不更新STOP头、动作策略或VLA。比较
+基线固定为Stage21扩大审计上限：ROC-AUC `0.6520`、最佳balanced accuracy `0.6753`、false
+positive `433/942`。用户要求停止主动轮询后，四个tmux后台audit保留运行，但不再持续监控；待
+用户下次要求时再读取结果并决定是否进行更长STOP训练。
+
+#### Stage22 固定共同样本扩大审计结果（2026-09-21）
+
+四个并行audit均正常完成，无traceback。受`val_time_limit=600`和并行I/O影响，原始结果实际
+覆盖step 250/500/750/1000的1000/968/1000/924个window。为避免样本池差异造成不公平比较，
+将四个Stage22报告和Stage21 step1000基线全部裁到完全同序的前924个样本；五份target逐项
+一致，其中54个terminal、870个non-terminal。重新使用与训练代码相同的精确AUC和全候选阈值
+扫描，结果如下：
+
+| model | ROC-AUC | class gap | best threshold | best balanced acc. | precision | recall | specificity | FP / 870 | FN / 54 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Stage21 binary step1000 | **0.6525** | 0.00187 | 0.08049 | **0.6769** | **0.0989** | 0.8148 | **0.5391** | **401** | 10 |
+| Stage22 progress step250 | 0.6339 | 0.00129 | 0.09736 | 0.6505 | 0.0896 | 0.8148 | 0.4862 | 447 | 10 |
+| Stage22 progress step500 | 0.6181 | 0.00393 | 0.13414 | 0.6368 | 0.0838 | **0.8519** | 0.4218 | 503 | **8** |
+| Stage22 progress step750 | 0.6309 | 0.00416 | 0.08921 | 0.6431 | 0.0864 | 0.8333 | 0.4529 | 476 | 9 |
+| Stage22 progress step1000 | 0.6402 | **0.00547** | 0.12075 | 0.6609 | 0.0930 | 0.8148 | 0.5069 | 429 | 10 |
+
+Stage22的正负均值gap随训练总体增大，但排序AUC和最佳balanced accuracy在所有checkpoint上均
+低于Stage21；step1000虽从step500低点恢复，仍需将429/870个continue状态误判为STOP，precision
+仅9.30%。因此`ACT+COND + remaining<=0/1/2/4`辅助监督没有通过结构修复门槛，不能通过阈值
+校准部署，也没有证据支持直接把同一配置盲目扩到30k。
+
+该结果仍不能完全排除训练量不足：1k optimizer step、有效batch 8只覆盖约8000个window。但
+更合理的验证方式是先做Stage21 binary与Stage22 progress的同预算5k对照（动作/VLA继续冻结，
+在1k间隔做固定验证），确认AUC是否持续上升；只有出现稳定上升趋势才扩到30k。若5k仍停留在
+0.62--0.66，则瓶颈是冻结ACT/COND特征缺少可分的终点信息，下一步应最小范围解冻LoRA并加入
+动作保持约束，而不是继续堆叠STOP-head训练步数。
+
+四个Stage22 checkpoint的动作与Condition模块均被冻结，因此扩大审计也提供了更可靠的
+Stage20 step750 Condition估计：924-window上Oracle/Condition-selected/branch-0 future loss约为
+`0.00849/0.01816/0.01918`，对应位置误差约`0.1067/0.1619/0.1785 m`，Oracle recovery仅
+`9.53%`；Condition branch accuracy约47.15%，虽超过K=3随机值33.33%，但实际动作收益很小。
+此前100-window得到的约50.22% recovery明显高估了泛化效果。这与Habitat闭环0成功和低匹配
+margin结论一致：Condition也不能仅凭增加同分布训练步数视为已解决，后续应优先做冻结动作的
+Condition-only对照及模型偏移状态recovery数据。
+
+### Stage23：Binary vs Progress STOP 5k 双种子对照（2026-09-21）
+
+Stage22未超过Stage21后，不直接把单一配置扩到30k，而是先检验“1k训练不足”假设。对照固定
+使用同一个Stage20 step750动作基座，并保持VLA、动作头、Condition adapter和5D proprio
+projector全部冻结；唯一变量是STOP结构。为估计随机种子方差，使用四张GPU运行2×2实验：
+
+| GPU | run | STOP结构 | seed |
+|---:|---|---|---:|
+| 0 | `stage23_binary_stop_sft_5k_seed17` | Stage21 binary ACT-only | 17 |
+| 1 | `stage23_progress_stop_sft_5k_seed17` | Stage22 ACT+COND progress | 17 |
+| 2 | `stage23_binary_stop_sft_5k_seed29` | Stage21 binary ACT-only | 29 |
+| 3 | `stage23_progress_stop_sft_5k_seed29` | Stage22 ACT+COND progress | 29 |
+
+四组均为5000 optimizer step、batch size 1、gradient accumulation 8、learning rate `1e-4`、
+warmup 100；每1000步验证，验证新增`val_max_batches=1000`并保留1800秒安全时限，确保同seed的
+结构对照最多使用完全相同的1000个window。只在step5000保存一次完整checkpoint，避免每组生成
+5份约15 GiB的冻结主模型。启动前Shell语法、Python编译和完整测试为**55/55 passed**。
+
+四组均已完成首步且无OOM/traceback。梯度审计一致：VLA、action head、condition adapter、
+proprio projector均为`None`，只有STOP head有非零梯度。因此这是四个独立的STOP结构/种子对照，
+不是四卡联合训练一个模型，也不会改变现有Stage20动作策略。
+
+确认Stage23正式运行后，永久删除已被扩大审计淘汰且不再作为初始化源的Stage21/Stage22
+step250/500/750/1000共8个完整checkpoint，以及相应audit/pilot临时runtime。审计JSON、日志、
+Stage20 step750和当前Stage23 runtime均保留。磁盘可用空间由约692 GiB增加到810 GiB，实际释放
+约118 GiB；删除的权重不可恢复，但对应实验结论和逐样本概率报告仍可复现比较。

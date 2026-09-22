@@ -1724,6 +1724,7 @@ class FinetuneConfig:
     val_tfds_split: Optional[str] = None              # Explicit validation split, e.g. train[95%:]
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
+    val_max_batches: int = 0                         # 0 disables; otherwise cap validation at this exact batch count
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
@@ -3218,7 +3219,9 @@ def run_validation(
             all_val_metrics.append(metrics)
             val_batches_count += 1
 
-            # Cut testing on validation set short if it exceeds time limit
+            # Prefer a reproducible batch cap; retain the time limit as a safety bound.
+            if cfg.val_max_batches > 0 and val_batches_count >= cfg.val_max_batches:
+                break
             if time.time() - val_start_time > val_time_limit:
                 break
 

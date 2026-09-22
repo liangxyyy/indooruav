@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 || ("$1" != "smoke" && "$1" != "pilot" && "$1" != "audit" && "$1" != "progress_smoke" && "$1" != "progress_pilot" && "$1" != "progress_audit") ]]; then
-  echo "Usage: bash vla-scripts/uav_eval/run_stage21_root_stop_sft.sh {smoke|pilot|audit|progress_smoke|progress_pilot|progress_audit}" >&2
+if [[ $# -ne 1 || ("$1" != "smoke" && "$1" != "pilot" && "$1" != "audit" && "$1" != "progress_smoke" && "$1" != "progress_pilot" && "$1" != "progress_audit" && "$1" != "binary_5k" && "$1" != "progress_5k") ]]; then
+  echo "Usage: bash vla-scripts/uav_eval/run_stage21_root_stop_sft.sh {smoke|pilot|audit|progress_smoke|progress_pilot|progress_audit|binary_5k|progress_5k}" >&2
   exit 2
 fi
 
@@ -14,6 +14,7 @@ SOURCE_CHECKPOINT="${RUN_ROOT}/stage20_base_bodydelta_sft_pilot_1k_v3--750_chkpt
 SOURCE_STEP=750
 USE_PROGRESS_STOP=False
 STOP_PROGRESS_LOSS_WEIGHT=0.0
+RUN_SEED="${STOP_COMPARE_SEED:-17}"
 
 if [[ "$MODE" == "smoke" || "$MODE" == "progress_smoke" ]]; then
   if [[ "$MODE" == "progress_smoke" ]]; then
@@ -54,6 +55,34 @@ elif [[ "$MODE" == "pilot" || "$MODE" == "progress_pilot" ]]; then
     --val_tfds_split 'train[95%:]'
     --val_freq 250
     --val_time_limit 120
+  )
+elif [[ "$MODE" == "binary_5k" || "$MODE" == "progress_5k" ]]; then
+  if ! [[ "$RUN_SEED" =~ ^[0-9]+$ ]]; then
+    echo "STOP_COMPARE_SEED must be a non-negative integer" >&2
+    exit 2
+  fi
+  if [[ "$MODE" == "progress_5k" ]]; then
+    RUN_ID="stage23_progress_stop_sft_5k_seed${RUN_SEED}"
+    USE_PROGRESS_STOP=True
+    STOP_PROGRESS_LOSS_WEIGHT=0.25
+  else
+    RUN_ID="stage23_binary_stop_sft_5k_seed${RUN_SEED}"
+  fi
+  MAX_STEPS=5000
+  SAVE_FREQ=5000
+  SHUFFLE_BUFFER=10000
+  IMAGE_AUG=True
+  GRAD_ACCUMULATION_STEPS=8
+  LEARNING_RATE=0.0001
+  LR_WARMUP_STEPS=100
+  TRAIN_REPORT_FREQ=100
+  VALIDATION_ARGS=(
+    --use_val_set True
+    --train_tfds_split 'train[:95%]'
+    --val_tfds_split 'train[95%:]'
+    --val_freq 1000
+    --val_time_limit 1800
+    --val_max_batches 1000
   )
 else
   AUDIT_STEP="${PILOT_AUDIT_STEP:-500}"
@@ -211,7 +240,7 @@ conda run --no-capture-output -n openvla-oft python -u vla-scripts/finetune.py \
   --learning_rate "$LEARNING_RATE" \
   --lr_warmup_steps "$LR_WARMUP_STEPS" \
   --max_grad_norm 10.0 \
-  --seed 17 \
+  --seed "$RUN_SEED" \
   --max_steps "$MAX_STEPS" \
   --save_freq "$SAVE_FREQ" \
   --train_report_freq "$TRAIN_REPORT_FREQ" \
